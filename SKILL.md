@@ -16,6 +16,8 @@ Current scope:
 - 출력 파일명 충돌 시 자동 번호 부여
 - 작업 계획만 확인하는 `--plan-only`
 - OpenClaw 상위 레이어 연동용 `--json`, `--report-json`
+- 한글 보안 확인 팝업 자동 허용용 `--auto-allow-dialogs`
+- 로컬 UI 검증용 `--self-test-dialog-handler`
 - 테스트용 `--mode mock`
 
 ## Source basis
@@ -33,6 +35,9 @@ Main logic origin:
 If you need the mapping details or reuse rationale, read:
 - `references/hwpmate-reuse-notes.md`
 
+If you need the popup whitelist / safety details, read:
+- `references/auto-allow-dialogs.md`
+
 ## Quick start
 
 같은 폴더에 PDF 출력:
@@ -44,7 +49,7 @@ python skills/hwp-batch-convert/scripts/hwp_batch_convert.py "C:\docs\contracts"
 별도 출력 폴더로 변환:
 
 ```bash
-python skills/hwp-batch-convert/scripts/hwp_batch_convert.py "C:\docs\hwp" --format PDF --output-dir "C:\docs\pdf"
+python skills/hwp-batch-convert/scripts/hwp_batch_convert.py "C:\docs\hwp" --format PDF --output-dir "C:\docs\pdf" --auto-allow-dialogs
 ```
 
 여러 파일 한 번에 변환:
@@ -79,8 +84,10 @@ Parameters:
 - `--overwrite`: 같은 이름 출력 허용
 - `--plan-only`: 실제 변환 없이 작업 계획만 생성
 - `--mode real|mock`: 실변환 또는 모의 변환
+- `--auto-allow-dialogs`: 제목 `한글`, 본문에 `접근하려는 시도`, 버튼 `모두 허용`/`허용` 조건을 모두 만족하는 보안 팝업만 자동 클릭
 - `--json`: stdout JSON 출력
 - `--report-json`: 결과 JSON 파일 저장
+- `--self-test-dialog-handler`: 로컬 테스트용 샘플 `한글` 창을 띄워 자동 클릭 로직만 검증
 
 ## Recommended workflow
 
@@ -95,6 +102,9 @@ Parameters:
 
 - 이 스킬은 사실상 **Windows 전용**이다.
 - 실변환(`--mode real`)은 **한컴 한글 설치**와 **pywin32**가 필요하다.
+- `--auto-allow-dialogs` 는 화이트리스트 방식이다. 제목이 `한글` 이고, 본문에 `접근하려는 시도` 가 있으며, 버튼이 `모두 허용` 또는 `허용` 인 경우에만 클릭한다.
+- 위 조건에 맞지 않는 다른 팝업은 자동으로 건드리지 않는다. 감지되더라도 클릭 없이 이벤트만 남기거나 무시한다.
+- 자동 허용 기록은 stdout JSON/`--report-json` 의 `auto_dialog_*` 필드와 `auto_dialog_events` 배열에서 확인한다.
 - 한글 COM 자동화가 실패하면 `--mode mock` 으로 스킬/경로 로직만 먼저 검증하고, 이후 환경 문제를 분리 진단한다.
 - 여러 폴더를 동시에 입력하면서 `--output-dir` 를 쓰면, 파일명 충돌 가능성이 있으니 결과 경로를 확인한다.
 - 기본 입력 확장자는 `.hwp`, `.hwpx` 만 대상으로 한다.

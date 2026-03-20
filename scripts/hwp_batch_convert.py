@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
-import shutil
 import subprocess
 import sys
+import threading
 import time
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -34,6 +36,37 @@ FORMAT_TYPES: dict[str, dict[str, str]] = {
     'GIF': {'ext': '.gif', 'save_format': 'GIF'},
 }
 HWP_PROCESS_NAMES = {'hwp.exe', 'hwpctrl.exe'}
+DIALOG_TITLE_WHITELIST = {'한글'}
+DIALOG_TEXT_KEYWORDS = ('접근하려는 시도',)
+DIALOG_ALLOW_BUTTONS = ('모두 허용', '허용')
+POLL_INTERVAL_SECONDS = 0.35
+WINDOW_SCAN_TIMEOUT_SECONDS = 3.0
+BM_CLICK = 0x00F5
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+
+
+USER32 = ctypes.WinDLL('user32', use_last_error=True)
+
+
+@dataclass
+class AutoDialogEvent:
+    window_title: str
+    window_text: str
+    button_text: str
+    clicked: bool
+    reason: str
+    timestamp: float = field(default_factory=time.time)
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            'timestamp': round(self.timestamp, 3),
+            'window_title': self.window_title,
+            'window_text': self.window_text,
+            'button_text': self.button_text,
+            'clicked': self.clicked,
+            'reason': self.reason,
+        }
 
 
 def canonicalize_path(path: str | Path) -> str:
@@ -99,11 +132,15 @@ class ConversionSummary:
     elapsed_seconds: float | None = None
     progid_used: str | None = None
     mode: str = 'real'
+    auto_dialog_enabled: bool = False
+    auto_dialog_events: list[AutoDialogEvent] = field(default_factory=list)
 
     def to_json_dict(self) -> dict[str, Any]:
         success = len([task for task in self.tasks if task.status == '성공'])
         failed = len([task for task in self.tasks if task.status == '실패'])
         skipped = len([task for task in self.tasks if task.status == '건너뜀'])
+        clicked = len([event for event in self.auto_dialog_events if event.clicked])
+        detected = len(self.auto_dialog_events)
         return {
             'summary': {
                 'format_type': self.format_type,
@@ -115,8 +152,12 @@ class ConversionSummary:
                 'elapsed_seconds': self.elapsed_seconds,
                 'progid_used': self.progid_used,
                 'warnings': self.warnings,
+                'auto_dialog_enabled': self.auto_dialog_enabled,
+                'auto_dialog_detected_count': detected,
+                'auto_dialog_clicked_count': clicked,
             },
             'tasks': [task.to_record() for task in sorted(self.tasks, key=lambda t: str(t.input_file).lower())],
+            'auto_dialog_events': [event.to_record() for event in self.auto_dialog_events],
         }
 
 
@@ -218,7 +259,8 @@ def _snapshot_hwp_pids() -> set[int]:
         result = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'], capture_output=True, text=True, encoding='utf-8', errors='ignore', check=False)
         if result.returncode != 0:
             return set()
-        import csv, io
+        import csv
+        import io
         reader = csv.reader(io.StringIO(result.stdout))
         pids: set[int] = set()
         for row in reader:
@@ -234,6 +276,123 @@ def _snapshot_hwp_pids() -> set[int]:
         return pids
     except Exception:
         return set()
+
+
+def _get_window_text(hwnd: int) -> str:
+    length = USER32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+    if length <= 0:
+        return ''
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    USER32.SendMessageW(hwnd, WM_GETTEXT, length + 1, ctypes.byref(buffer))
+    return buffer.value.strip()
+
+
+def _get_class_name(hwnd: int) -> str:
+    buffer = ctypes.create_unicode_buffer(256)
+    USER32.GetClassNameW(hwnd, buffer, 256)
+    return buffer.value
+
+
+class AutoAllowDialogWatcher:
+    def __init__(self, *, enabled: bool = False, poll_interval: float = POLL_INTERVAL_SECONDS) -> None:
+        self.enabled = enabled
+        self.poll_interval = poll_interval
+        self.events: list[AutoDialogEvent] = []
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._handled_hwnds: set[int] = set()
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._thread = threading.Thread(target=self._run, name='hwp-auto-allow-dialogs', daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def snapshot_events(self) -> list[AutoDialogEvent]:
+        with self._lock:
+            return list(self.events)
+
+    def click_once_for_test(self, timeout_seconds: float = WINDOW_SCAN_TIMEOUT_SECONDS) -> bool:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if self._scan_once():
+                return True
+            time.sleep(self.poll_interval)
+        return False
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.poll_interval):
+            self._scan_once()
+
+    def _scan_once(self) -> bool:
+        matched = False
+        hwnds: list[int] = []
+
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(lambda hwnd, lparam: hwnds.append(hwnd) or True)
+        USER32.EnumWindows(enum_proc, 0)
+
+        for hwnd in hwnds:
+            if hwnd in self._handled_hwnds or not USER32.IsWindowVisible(hwnd):
+                continue
+            title = USER32.GetWindowTextLengthW(hwnd)
+            if title <= 0:
+                continue
+            window_title = ctypes.create_unicode_buffer(title + 1)
+            USER32.GetWindowTextW(hwnd, window_title, title + 1)
+            if window_title.value.strip() not in DIALOG_TITLE_WHITELIST:
+                continue
+            text_parts, allow_button_hwnd, allow_button_text = self._inspect_dialog(hwnd)
+            window_text = ' '.join(part for part in text_parts if part).strip()
+            reason = self._classify_candidate(window_title.value.strip(), window_text, allow_button_text)
+            if reason != 'match':
+                if window_text:
+                    self._record_event(AutoDialogEvent(window_title=window_title.value.strip(), window_text=window_text, button_text=allow_button_text, clicked=False, reason=reason))
+                    self._handled_hwnds.add(hwnd)
+                continue
+            clicked = False
+            if allow_button_hwnd:
+                USER32.SendMessageW(allow_button_hwnd, BM_CLICK, 0, 0)
+                clicked = True
+            self._record_event(AutoDialogEvent(window_title=window_title.value.strip(), window_text=window_text, button_text=allow_button_text, clicked=clicked, reason='clicked' if clicked else 'allow-button-not-found'))
+            self._handled_hwnds.add(hwnd)
+            matched = matched or clicked
+        return matched
+
+    def _inspect_dialog(self, hwnd: int) -> tuple[list[str], int | None, str]:
+        parts: list[str] = []
+        allow_button_hwnd: int | None = None
+        allow_button_text = ''
+        child_hwnds: list[int] = []
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(lambda child, lparam: child_hwnds.append(child) or True)
+        USER32.EnumChildWindows(hwnd, enum_proc, 0)
+        for child in child_hwnds:
+            text = _get_window_text(child)
+            class_name = _get_class_name(child)
+            if text:
+                parts.append(text)
+            if 'BUTTON' in class_name.upper() and text in DIALOG_ALLOW_BUTTONS and allow_button_hwnd is None:
+                allow_button_hwnd = child
+                allow_button_text = text
+        return parts, allow_button_hwnd, allow_button_text
+
+    def _classify_candidate(self, title: str, window_text: str, allow_button_text: str) -> str:
+        if title not in DIALOG_TITLE_WHITELIST:
+            return 'title-mismatch'
+        if not all(keyword in window_text for keyword in DIALOG_TEXT_KEYWORDS):
+            return 'text-mismatch'
+        if not allow_button_text:
+            return 'button-mismatch'
+        return 'match'
+
+    def _record_event(self, event: AutoDialogEvent) -> None:
+        with self._lock:
+            self.events.append(event)
 
 
 class RealHwpConverter:
@@ -323,6 +482,8 @@ def render_human(summary: ConversionSummary) -> str:
     ]
     if data['warnings']:
         lines.append('경고: ' + ' / '.join(data['warnings']))
+    if summary.auto_dialog_enabled:
+        lines.append(f"보안 팝업 자동 허용: 감지 {data['auto_dialog_detected_count']} | 클릭 {data['auto_dialog_clicked_count']}")
     failed = [task for task in summary.tasks if task.status == '실패']
     if failed:
         lines.append('실패 목록:')
@@ -341,6 +502,8 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
         output_path=args.output_dir or '',
     )
     plan.conflict_renamed_count = planner.resolve_output_conflicts(plan.tasks, overwrite=args.overwrite)
+    if plan.conflict_renamed_count:
+        plan.warnings.append(f'출력 파일 충돌 {plan.conflict_renamed_count}건은 자동으로 새 이름을 부여했습니다.')
     all_tasks = list(plan.skipped_tasks)
     start = time.time()
 
@@ -348,10 +511,12 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
         for task in plan.tasks:
             task.status = '계획됨'
         all_tasks.extend(plan.tasks)
-        return ConversionSummary(format_type=args.format, tasks=all_tasks, warnings=plan.warnings, elapsed_seconds=round(time.time() - start, 3), mode='plan')
+        return ConversionSummary(format_type=args.format, tasks=all_tasks, warnings=plan.warnings, elapsed_seconds=round(time.time() - start, 3), mode='plan', auto_dialog_enabled=args.auto_allow_dialogs)
 
     converter = choose_converter(args.mode)
+    dialog_watcher = AutoAllowDialogWatcher(enabled=args.auto_allow_dialogs and args.mode == 'real')
     converter.initialize()
+    dialog_watcher.start()
     try:
         for task in plan.tasks:
             ok, error = converter.convert_file(task.input_file, task.output_file, args.format)
@@ -359,7 +524,15 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
             task.error = error
             all_tasks.append(task)
     finally:
+        dialog_watcher.stop()
         converter.cleanup()
+
+    dialog_events = dialog_watcher.snapshot_events()
+    if args.auto_allow_dialogs and args.mode != 'real':
+        plan.warnings.append('--auto-allow-dialogs 는 real 모드에서만 실제 동작합니다.')
+    if dialog_events:
+        clicked = len([event for event in dialog_events if event.clicked])
+        plan.warnings.append(f'보안 팝업 자동 허용 기록: 감지 {len(dialog_events)}건, 클릭 {clicked}건')
 
     return ConversionSummary(
         format_type=args.format,
@@ -368,12 +541,54 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
         elapsed_seconds=round(time.time() - start, 3),
         progid_used=getattr(converter, 'progid_used', None),
         mode=args.mode,
+        auto_dialog_enabled=args.auto_allow_dialogs,
+        auto_dialog_events=dialog_events,
     )
+
+
+def run_dialog_self_test(timeout_seconds: float = 8.0) -> dict[str, Any]:
+    dialog_script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$form = New-Object System.Windows.Forms.Form
+$form.Text = '한글'
+$form.Width = 420
+$form.Height = 170
+$form.StartPosition = 'CenterScreen'
+$label = New-Object System.Windows.Forms.Label
+$label.AutoSize = $true
+$label.Left = 20
+$label.Top = 20
+$label.Text = '한글 문서에 접근하려는 시도를 허용하시겠습니까?'
+$form.Controls.Add($label)
+$button = New-Object System.Windows.Forms.Button
+$button.Text = '모두 허용'
+$button.Left = 20
+$button.Top = 70
+$button.Width = 100
+$button.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$form.AcceptButton = $button
+$form.Controls.Add($button)
+[void]$form.ShowDialog()
+""".strip()
+    watcher = AutoAllowDialogWatcher(enabled=True, poll_interval=0.2)
+    proc = subprocess.Popen(['powershell', '-NoProfile', '-STA', '-Command', dialog_script])
+    try:
+        clicked = watcher.click_once_for_test(timeout_seconds=timeout_seconds)
+        proc.wait(timeout=timeout_seconds)
+        events = watcher.snapshot_events()
+        return {
+            'clicked': clicked,
+            'returncode': proc.returncode,
+            'events': [event.to_record() for event in events],
+        }
+    finally:
+        if proc.poll() is None:
+            proc.kill()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='한글(HWP/HWPX) 문서를 PDF/DOCX/HWPX 등으로 일괄 변환합니다.')
-    parser.add_argument('sources', nargs='+', help='입력 파일 또는 폴더 경로(여러 개 가능)')
+    parser.add_argument('sources', nargs='*', help='입력 파일 또는 폴더 경로(여러 개 가능)')
     parser.add_argument('--format', default='PDF', choices=sorted(FORMAT_TYPES.keys()), help='출력 형식')
     parser.add_argument('--include-sub', action='store_true', default=True, help='하위 폴더 포함(기본값: 켜짐)')
     parser.add_argument('--no-include-sub', dest='include_sub', action='store_false', help='하위 폴더 미포함')
@@ -382,9 +597,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--overwrite', action='store_true', help='같은 이름 출력 파일 덮어쓰기 허용')
     parser.add_argument('--plan-only', action='store_true', help='실제 변환 없이 작업 계획만 출력')
     parser.add_argument('--mode', choices=['real', 'mock'], default='real', help='real=한글 COM 실변환, mock=테스트용 가짜 변환')
+    parser.add_argument('--auto-allow-dialogs', action='store_true', help='한글 보안 확인 팝업(제목=한글, 본문에 접근하려는 시도, 버튼=모두 허용)만 자동 클릭')
     parser.add_argument('--json', action='store_true', help='JSON 출력')
     parser.add_argument('--report-json', help='결과 JSON 파일 저장 경로')
+    parser.add_argument('--self-test-dialog-handler', action='store_true', help='보안 팝업 자동 클릭 로직의 로컬 UI 테스트를 실행')
     args = parser.parse_args()
+    if args.self_test_dialog_handler:
+        return args
+    if not args.sources:
+        parser.error('입력 파일 또는 폴더를 하나 이상 지정하세요.')
     if not args.same_location and not args.output_dir:
         parser.error('--same-location 또는 --output-dir 중 하나를 지정하세요.')
     return args
@@ -393,10 +614,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        if args.self_test_dialog_handler:
+            payload = run_dialog_self_test()
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0 if payload['clicked'] and payload['returncode'] == 0 else 1
         summary = run_conversion(args)
     except Exception as exc:
         error_payload = {'error': str(exc)}
-        if args.json:
+        if getattr(args, 'json', False):
             print(json.dumps(error_payload, ensure_ascii=False, indent=2))
         else:
             print(f'오류: {exc}', file=sys.stderr)
