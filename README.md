@@ -1,4 +1,4 @@
-﻿# OpenClaw Skill: HWP Batch Convert
+# OpenClaw Skill: HWP Batch Convert
 
 `openclaw-hwp-batch-convert`는 Windows에서 한컴 한글 **HWP/HWPX 문서를 폴더 단위로 일괄 변환**하는 **OpenClaw AgentSkill 저장소**입니다.
 
@@ -50,17 +50,23 @@
 
 - HWP / HWPX 입력 지원
 - PDF / HWPX / DOCX / ODT / HTML / RTF / TXT / PNG / JPG / BMP / GIF / HWP 출력
-- 폴더 단위 일괄 변환
-- 여러 파일 동시 입력
-- 하위 폴더 포함/제외 옵션
+- 폴더 단위 일괄 변환 및 여러 파일 동시 입력
+- 하위 폴더 포함/제외 옵션 (`--include-sub` / `--no-include-sub`)
 - 같은 형식 자동 건너뜀
-- 파일명 충돌 시 자동 번호 부여
+- 파일명 충돌 시 자동 번호 부여 및 **저장 직전 원자적 재검증(TOCTOU 방어)**
+- **HTML(`.files` 폴더) 및 이미지 다중 산출물(Auxiliary Artifacts) 추적/충돌 회피 및 실패 시 자동 정리**
+- **한글 보안 모듈(FilePathCheckDLL) 사전 준비 + 레지스트리 자동 등록 (`--ensure-security-module`)**
+- **2단계 보안 안전망**: 1단계 보안 DLL 등록 + 2단계 `AutoAllowDialogWatcher` 폴백
+- **PDF 변환 품질 고도화**: 문서 인쇄 설정(모아찍기 등) 1쪽씩 일반 인쇄 리셋 (`PrintMethod=0`)
+- **PDF 가상 프린터 자동 폴백**: SaveAs 실패 시 `PrintToPDFEx` / `RunToPDF` 자동 시도 (물리 프린터 출력은 원천 차단)
+- **`%PDF` 매직 헤더 검증 및 불완전/깨진 파일 자동 정리**
+- **변환 전 원본 파일 자동 백업 (`--backup`, `--backup-max-per-stem`)**
+- 긴 경로(240자/260자) 및 UNC 네트워크 경로 대응용 `com_path_candidates` 확장 경로(`\\?\`) 지원
 - 지원하지 않는 단일 입력 파일 조기 에러 처리
 - `--plan-only` 작업 계획 확인
-- `--json` 표준 출력
+- `--json` 표준 출력 (정밀 감사 메타데이터: created_files, output_size, output_mtime, save_format, export_method, progid_used 등 포함)
 - `--report-json` 결과/에러 JSON 파일 저장
 - `--mode mock` 모의 변환 테스트
-- `--auto-allow-dialogs` 보안 확인 팝업 자동 허용
 - `--startup-timeout-seconds`, `--file-timeout-seconds` real 모드 timeout 제어
 - `--kill-owned-hwp-on-timeout` timeout 시 자동화로 띄운 HWP 정리 시도
 - `--fail-fast` 실패 후 즉시 중단
@@ -86,7 +92,9 @@ hwp-batch-convert/
 │   ├── hwp_batch_convert.py
 │   ├── hwp_batch_core.py
 │   ├── hwp_batch_dialogs.py
-│   └── hwp_batch_real.py
+│   ├── hwp_batch_print.py
+│   ├── hwp_batch_real.py
+│   └── hwp_batch_security.py
 └── tests/
     └── test_hwp_batch_convert.py
 ```

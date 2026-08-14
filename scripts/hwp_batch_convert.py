@@ -8,24 +8,40 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+# Windows 콘솔 출력 UTF-8 안전화
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from hwp_batch_core import (
+    BACKUP_MAX_FILES_PER_STEM,
     DEFAULT_FILE_TIMEOUT_SECONDS,
     DEFAULT_STARTUP_TIMEOUT_SECONDS,
     FAIL_FAST_DETAIL,
     FORMAT_TYPES,
+    MAX_RETRY_COUNT,
+    RETRY_DELAY_SECONDS,
     STATUS_FAILED,
     STATUS_PLANNED,
     STATUS_SKIPPED,
     STATUS_SUCCESS,
     ConversionSummary,
+    MockConverter,
     TaskPlanner,
+    create_backup,
     dedupe_strings,
     determine_exit_code,
     render_human,
     write_json_file,
 )
 from hwp_batch_dialogs import AutoAllowDialogWatcher
-from hwp_batch_core import MockConverter
 from hwp_batch_real import run_internal_real_worker, run_real_worker_task
 
 
@@ -45,8 +61,15 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
         output_path=args.output_dir or "",
         allow_empty=args.allow_empty,
         preserve_source_root=args.preserve_source_root,
+        backup_enabled=args.backup,
+        backup_max_per_stem=args.backup_max_per_stem,
+        pdf_export_mode=args.pdf_export_mode,
     )
-    plan.conflict_renamed_count = planner.resolve_output_conflicts(plan.tasks, overwrite=args.overwrite)
+    plan.conflict_renamed_count = planner.resolve_output_conflicts(
+        plan.tasks,
+        overwrite=args.overwrite,
+        format_type=args.format,
+    )
     if plan.conflict_renamed_count:
         plan.warnings.append(f"출력 파일 충돌 {plan.conflict_renamed_count}건은 자동으로 새 이름을 부여했습니다.")
 
@@ -55,6 +78,8 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
     warnings = list(plan.warnings)
     progids: list[str] = []
     start = time.time()
+    backup_count = 0
+    max_retries = max(0, min(MAX_RETRY_COUNT, getattr(args, "retry_count", 1)))
 
     if args.plan_only:
         for task in plan.tasks:
@@ -67,6 +92,9 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
             elapsed_seconds=round(time.time() - start, 3),
             mode="plan",
             auto_dialog_enabled=args.auto_allow_dialogs,
+            backup_enabled=args.backup,
+            backup_count=0,
+            pdf_export_mode=args.pdf_export_mode,
         )
 
     if not plan.tasks:
@@ -77,14 +105,37 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
             elapsed_seconds=round(time.time() - start, 3),
             mode=args.mode,
             auto_dialog_enabled=args.auto_allow_dialogs,
+            backup_enabled=args.backup,
+            backup_count=0,
+            pdf_export_mode=args.pdf_export_mode,
         )
 
     if args.mode == "real":
         script_path = Path(__file__).resolve()
         for index, task in enumerate(plan.tasks):
-            result = run_real_worker_task(task, args, script_path)
+            retried = 0
+            while True:
+                result = run_real_worker_task(task, args, script_path)
+                if result.ok or retried >= max_retries:
+                    break
+                retried += 1
+                time.sleep(RETRY_DELAY_SECONDS)
+
             task.status = STATUS_SUCCESS if result.ok else STATUS_FAILED
             task.error = result.error
+            task.retry_count = retried
+            if result.final_output_file:
+                task.output_file = result.final_output_file
+            if result.created_files:
+                task.created_files = result.created_files
+            task.output_size = result.output_size
+            task.output_mtime = result.output_mtime
+            task.save_format = result.save_format
+            task.export_method = result.export_method
+            task.backup_file = result.backup_file
+            if result.backup_file:
+                backup_count += 1
+
             all_tasks.append(task)
             warnings.extend(result.warnings)
             auto_dialog_events.extend(result.auto_dialog_events)
@@ -102,10 +153,33 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
         converter.initialize()
         try:
             for index, task in enumerate(plan.tasks):
-                ok, error = converter.convert_file(task.input_file, task.output_file, args.format)
+                backup_path = None
+                if args.backup:
+                    try:
+                        backup_path = create_backup(task.input_file, max_files=args.backup_max_per_stem)
+                        backup_count += 1
+                    except Exception as e:
+                        warnings.append(f"백업 실패: {e}")
+
+                retried = 0
+                while True:
+                    ok, error = converter.convert_file(task.input_file, task.output_file, args.format)
+                    if ok or retried >= max_retries:
+                        break
+                    retried += 1
+                    time.sleep(0.05)
+
                 task.status = STATUS_SUCCESS if ok else STATUS_FAILED
                 task.error = error
+                task.retry_count = retried
+                task.created_files = list(getattr(converter, "last_created_files", [task.output_file]))
+                task.output_size = getattr(converter, "last_output_size", None)
+                task.output_mtime = getattr(converter, "last_output_mtime", None)
+                task.save_format = getattr(converter, "last_save_format", None)
+                task.export_method = getattr(converter, "last_export_method", "mock")
+                task.backup_file = backup_path
                 all_tasks.append(task)
+
                 if not ok and args.fail_fast:
                     warnings.append("--fail-fast에 따라 남은 작업을 건너뛰었습니다.")
                     for remaining_task in plan.tasks[index + 1 :]:
@@ -134,6 +208,9 @@ def run_conversion(args: argparse.Namespace) -> ConversionSummary:
         mode=args.mode,
         auto_dialog_enabled=args.auto_allow_dialogs,
         auto_dialog_events=auto_dialog_events,
+        backup_enabled=args.backup,
+        backup_count=backup_count,
+        pdf_export_mode=args.pdf_export_mode,
     )
 
 
@@ -199,6 +276,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plan-only", action="store_true", help="실제 변환 없이 작업 계획만 출력")
     parser.add_argument("--mode", choices=["real", "mock"], default="real", help="real=한글 COM 실변환, mock=테스트용 가짜 변환")
     parser.add_argument("--auto-allow-dialogs", action="store_true", help="한글 보안 확인 팝업을 소유 HWP 프로세스 범위에서만 자동 클릭")
+    parser.add_argument("--ensure-security-module", action="store_true", default=True, help="한글 보안 모듈(FilePathCheckDLL) 설치 및 등록 보장(기본값: 켜짐)")
+    parser.add_argument("--no-ensure-security-module", dest="ensure_security_module", action="store_false", help="보안 모듈 등록 건너뜀")
+    parser.add_argument("--pdf-export-mode", choices=["saveas_first", "print_to_pdf_ex_first"], default="saveas_first", help="PDF 변환 전략(saveas_first: 품질우선, print_to_pdf_ex_first: 모아찍기완화우선)")
+    parser.add_argument("--retry-count", type=int, default=1, help="변환 실패 시 자동 재시도 횟수 (0~3, 기본 1)")
+    parser.add_argument("--backup", action="store_true", default=False, help="변환 전 원본 파일을 backup/ 폴더에 자동 백업")
+    parser.add_argument("--backup-max-per-stem", type=int, default=BACKUP_MAX_FILES_PER_STEM, help="동일 파일명당 최대 백업 보관 수 (기본 20)")
     parser.add_argument("--json", action="store_true", help="JSON 출력")
     parser.add_argument("--report-json", help="결과 JSON 파일 저장 경로")
     parser.add_argument("--startup-timeout-seconds", type=float, default=DEFAULT_STARTUP_TIMEOUT_SECONDS, help="real 모드 초기화 timeout(초)")
@@ -209,12 +292,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preserve-source-root", action="store_true", help="여러 입력 source를 output-dir 아래에서 source 이름별로 구분")
     parser.add_argument("--kill-owned-hwp-on-timeout", action="store_true", help="timeout 발생 시 이번 실행이 띄운 HWP 프로세스를 정리 시도")
     parser.add_argument("--self-test-dialog-handler", action="store_true", help="보안 팝업 자동 클릭 로직의 로컬 UI 테스트를 실행")
+
+    # 내부 워커용 인자 (숨김)
     parser.add_argument("--internal-worker-real-convert", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-input", help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", help=argparse.SUPPRESS)
     parser.add_argument("--worker-format", help=argparse.SUPPRESS)
     parser.add_argument("--worker-state-json", help=argparse.SUPPRESS)
     parser.add_argument("--worker-auto-allow-dialogs", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-overwrite", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-backup", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-backup-max-per-stem", type=int, default=20, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-pdf-export-mode", default="saveas_first", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-ensure-security-module", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args(argv)
     if args.internal_worker_real_convert:

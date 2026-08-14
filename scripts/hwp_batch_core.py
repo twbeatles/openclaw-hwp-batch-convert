@@ -1,23 +1,43 @@
 from __future__ import annotations
 
+import datetime
 import json
 import os
+import re
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence, Set
 
 SUPPORTED_EXTENSIONS = (".hwp", ".hwpx")
 MAX_FILENAME_COUNTER = 1000
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 20.0
 DEFAULT_FILE_TIMEOUT_SECONDS = 120.0
 
+BACKUP_DIR_NAME = "backup"
+BACKUP_MAX_FILES_PER_STEM = 20
+BACKUP_MAX_FILES_PER_STEM_MIN = 1
+BACKUP_MAX_FILES_PER_STEM_MAX = 100
+
+MAX_RETRY_COUNT = 3
+RETRY_DELAY_SECONDS = 1.0
+
+WINDOWS_PATH_WARN_LENGTH = 240
+WINDOWS_PATH_BLOCK_LENGTH = 260
+
+AUXILIARY_ARTIFACT_FORMATS = frozenset({"HTML", "PNG", "JPG", "BMP", "GIF"})
+AUXILIARY_NAME_DELIMITERS = frozenset({"_", "-", " ", ".", "("})
+MAX_AUXILIARY_SCAN_FILES = 500
+
 HWP_PROGIDS = [
     "HWPControl.HwpCtrl.1",
     "HwpObject.HwpObject",
     "HWPFrame.HwpObject",
 ]
+
 FORMAT_TYPES: dict[str, dict[str, str]] = {
     "HWP": {"ext": ".hwp", "save_format": "HWP"},
     "HWPX": {"ext": ".hwpx", "save_format": "HWPX"},
@@ -41,29 +61,129 @@ STATUS_SKIPPED = "건너뜀"
 FAIL_FAST_DETAIL = "이전 작업 실패 후 --fail-fast로 중단했습니다."
 
 
+# ============================================================================
+# 경로 유틸리티
+# ============================================================================
+
 def canonicalize_path(path: str | Path) -> str:
     return os.path.abspath(os.path.normpath(str(path)))
+
+
+def path_char_length(path: str | Path) -> int:
+    return len(str(path))
+
+
+def is_path_length_risky(path: str | Path, *, warn_length: int = WINDOWS_PATH_WARN_LENGTH) -> bool:
+    return path_char_length(path) >= max(1, int(warn_length))
+
+
+def is_path_length_blocking(path: str | Path, *, block_length: int = WINDOWS_PATH_BLOCK_LENGTH) -> bool:
+    return path_char_length(path) >= max(1, int(block_length))
+
+
+def to_extended_win_path(path: str | Path) -> str:
+    raw = str(path).strip()
+    if not raw:
+        return raw
+    normalized = os.path.abspath(os.path.normpath(raw.replace("/", "\\")))
+    if normalized.startswith("\\\\?\\"):
+        return normalized
+    if normalized.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + normalized[2:]
+    return "\\\\?\\" + normalized
+
+
+def com_path_candidates(path: str | Path) -> list[str]:
+    primary = os.path.abspath(os.path.normpath(str(path)))
+    extended = to_extended_win_path(primary)
+    if primary == extended or path_char_length(primary) < 200:
+        if primary == extended:
+            return [primary]
+        return [primary, extended]
+    return [extended, primary]
+
+
+def is_valid_path_name(path: str | Path) -> bool:
+    raw = str(path).strip()
+    if not raw:
+        return False
+    if any(ord(char) < 32 for char in raw):
+        return False
+
+    normalized = raw.replace("/", "\\")
+    extended_unc_prefix = "\\\\?\\UNC\\"
+    extended_prefix = "\\\\?\\"
+    if normalized.startswith(extended_unc_prefix):
+        normalized = "\\\\" + normalized[len(extended_unc_prefix) :]
+    elif normalized.startswith(extended_prefix):
+        normalized = normalized[len(extended_prefix) :]
+
+    invalid_chars = '<>"|?*'
+    if any(char in normalized for char in invalid_chars):
+        return False
+
+    path_without_drive = normalized
+    if len(normalized) >= 2 and normalized[1] == ":":
+        if not normalized[0].isalpha():
+            return False
+        path_without_drive = normalized[2:]
+    if ":" in path_without_drive:
+        return False
+
+    reserved_names = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    }
+    for part in re.split(r"[\\]+", path_without_drive):
+        if not part or part in {".", ".."}:
+            continue
+        if part.endswith((" ", ".")):
+            return False
+        base = part.split(".")[0].upper()
+        if base in reserved_names:
+            return False
+    return True
+
+
+def check_write_permission(folder_path: Path) -> bool:
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=folder_path,
+            prefix=".hwp_batch_write_test_",
+            delete=True,
+        ):
+            pass
+        return True
+    except (PermissionError, OSError):
+        return False
 
 
 def iter_supported_files(
     root_path: Path,
     include_sub: bool = True,
     allowed_exts: Optional[Iterable[str]] = None,
+    excluded_dir_names: Optional[Iterable[str]] = None,
 ) -> Iterable[Path]:
     allowed = {ext.lower() for ext in (allowed_exts or SUPPORTED_EXTENSIONS)}
+    excluded_dirs = {name.lower() for name in (excluded_dir_names or (BACKUP_DIR_NAME,))}
+
     if root_path.is_file():
         if root_path.suffix.lower() in allowed:
             yield root_path
         return
     if not root_path.is_dir():
         return
+
     if include_sub:
-        for dirpath, _, filenames in os.walk(root_path):
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            dirnames[:] = [d for d in dirnames if d.lower() not in excluded_dirs]
             for filename in filenames:
                 _, ext = os.path.splitext(filename)
                 if ext.lower() in allowed:
                     yield Path(dirpath) / filename
         return
+
     with os.scandir(root_path) as entries:
         for entry in entries:
             if not entry.is_file():
@@ -134,6 +254,251 @@ def kill_processes(pids: Iterable[int]) -> list[int]:
     return killed
 
 
+# ============================================================================
+# 보조 산출물 (Auxiliary Artifacts) 추적 및 정책
+# ============================================================================
+
+def uses_auxiliary_artifacts(format_type: str) -> bool:
+    return format_type.upper() in AUXILIARY_ARTIFACT_FORMATS
+
+
+def matches_artifact_stem(name: str, stem: str) -> bool:
+    name_key = name.lower()
+    stem_key = stem.lower()
+    if not stem_key:
+        return False
+    if name_key == stem_key:
+        return True
+    if not name_key.startswith(stem_key):
+        return False
+    if len(name_key) == len(stem_key):
+        return True
+    return name_key[len(stem_key)] in AUXILIARY_NAME_DELIMITERS
+
+
+def artifact_key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve() if path.exists() else path.absolute()))
+
+
+def iter_candidate_artifact_paths(
+    output_file: Path,
+    format_type: str,
+    *,
+    include_nested: bool = True,
+    nested_limit: int = MAX_AUXILIARY_SCAN_FILES,
+) -> list[Path]:
+    candidates: dict[str, Path] = {artifact_key(output_file): output_file}
+    if not uses_auxiliary_artifacts(format_type):
+        return list(candidates.values())
+
+    parent = output_file.parent
+    if not parent.exists():
+        return list(candidates.values())
+
+    stem = output_file.stem
+    nested_count = 0
+    try:
+        for child in parent.iterdir():
+            if not matches_artifact_stem(child.name, stem):
+                continue
+            if child.is_file():
+                candidates[artifact_key(child)] = child
+                continue
+            if child.is_dir() and include_nested:
+                if nested_count >= nested_limit:
+                    continue
+                try:
+                    for nested in child.rglob("*"):
+                        if not nested.is_file():
+                            continue
+                        if nested_count >= nested_limit:
+                            break
+                        candidates[artifact_key(nested)] = nested
+                        nested_count += 1
+                except OSError:
+                    continue
+    except OSError:
+        return list(candidates.values())
+
+    return list(candidates.values())
+
+
+def existing_artifact_conflicts(output_file: Path, format_type: str) -> list[Path]:
+    conflicts: dict[str, Path] = {}
+    if output_file.exists():
+        conflicts[artifact_key(output_file)] = output_file
+
+    if not uses_auxiliary_artifacts(format_type):
+        return list(conflicts.values())
+
+    parent = output_file.parent
+    if not parent.exists():
+        return list(conflicts.values())
+
+    try:
+        for child in parent.iterdir():
+            if child == output_file:
+                continue
+            if matches_artifact_stem(child.name, output_file.stem):
+                conflicts[artifact_key(child)] = child
+    except OSError:
+        return list(conflicts.values())
+
+    return sorted(conflicts.values(), key=lambda path: str(path).lower())
+
+
+@dataclass(frozen=True)
+class FileArtifactSnapshot:
+    size: int
+    mtime_ns: int
+
+
+def snapshot_artifacts(output_file: Path, format_type: str) -> dict[Path, FileArtifactSnapshot]:
+    snapshot: dict[Path, FileArtifactSnapshot] = {}
+    candidates = iter_candidate_artifact_paths(output_file, format_type, include_nested=True)
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            st = path.stat()
+            snapshot[path] = FileArtifactSnapshot(size=st.st_size, mtime_ns=st.st_mtime_ns)
+        except OSError:
+            continue
+    return snapshot
+
+
+def changed_artifacts(
+    before: dict[Path, FileArtifactSnapshot],
+    after: dict[Path, FileArtifactSnapshot],
+) -> list[Path]:
+    changed: list[Path] = []
+    for path, meta in after.items():
+        prev = before.get(path)
+        if prev is None:
+            changed.append(path)
+            continue
+        if meta.size != prev.size or meta.mtime_ns != prev.mtime_ns:
+            changed.append(path)
+    return sorted(changed, key=lambda p: str(p).lower())
+
+
+def remove_new_attempt_artifacts(
+    before: dict[Path, FileArtifactSnapshot],
+    output_file: Path,
+    format_type: str,
+) -> tuple[list[Path], list[str]]:
+    removed: list[Path] = []
+    warnings: list[str] = []
+    current = iter_candidate_artifact_paths(output_file, format_type, include_nested=True)
+    for path in current:
+        if path in before:
+            continue
+        try:
+            if path.is_file():
+                path.unlink(missing_ok=True)
+                removed.append(path)
+        except OSError as e:
+            warnings.append(f"임시 파일 정리 실패: {path.name} ({e})")
+
+    # 빈 디렉터리 정리
+    if uses_auxiliary_artifacts(format_type):
+        parent = output_file.parent
+        stem = output_file.stem
+        if parent.exists():
+            try:
+                for child in parent.iterdir():
+                    if child.is_dir() and matches_artifact_stem(child.name, stem):
+                        try:
+                            if not any(child.iterdir()):
+                                child.rmdir()
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+    return sorted(removed, key=lambda p: str(p).lower()), warnings
+
+
+# ============================================================================
+# 백업(Backup) 시스템
+# ============================================================================
+
+def clamp_backup_max(max_files: int | None) -> int:
+    base = BACKUP_MAX_FILES_PER_STEM if max_files is None else int(max_files)
+    return max(BACKUP_MAX_FILES_PER_STEM_MIN, min(BACKUP_MAX_FILES_PER_STEM_MAX, base))
+
+
+def prune_old_backups(
+    backup_dir: Path,
+    stem: str,
+    suffix: str,
+    *,
+    keep_path: Path | None = None,
+    max_files: int | None = None,
+) -> None:
+    try:
+        max_keep = clamp_backup_max(max_files)
+        prefix = f"{stem}_"
+        keep_resolved = keep_path.resolve() if keep_path is not None else None
+        candidates: list[Path] = []
+        for entry in backup_dir.iterdir():
+            if not entry.is_file():
+                continue
+            if entry.suffix.lower() != suffix.lower():
+                continue
+            if not entry.name.startswith(prefix):
+                continue
+            if keep_resolved is not None and entry.resolve() == keep_resolved:
+                continue
+            candidates.append(entry)
+
+        slots_for_old = max_keep - (1 if keep_resolved is not None else 0)
+        if slots_for_old < 0:
+            slots_for_old = 0
+        if len(candidates) <= slots_for_old:
+            return
+        candidates.sort(key=lambda p: (p.stat().st_mtime, p.name))
+        for old in candidates[: len(candidates) - slots_for_old]:
+            try:
+                old.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def create_backup(file_path: Path, *, max_files: int | None = None) -> Path:
+    try:
+        backup_dir = file_path.parent / BACKUP_DIR_NAME
+        backup_dir.mkdir(exist_ok=True)
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_name = f"{file_path.stem}_{timestamp}{file_path.suffix}"
+        backup_path = backup_dir / backup_name
+        counter = 1
+
+        while backup_path.exists():
+            backup_name = f"{file_path.stem}_{timestamp}_{counter}{file_path.suffix}"
+            backup_path = backup_dir / backup_name
+            counter += 1
+
+        shutil.copy2(file_path, backup_path)
+        prune_old_backups(
+            backup_dir,
+            file_path.stem,
+            file_path.suffix,
+            keep_path=backup_path,
+            max_files=max_files,
+        )
+        return backup_path
+    except Exception as e:
+        raise RuntimeError(f"백업 생성 실패 ({file_path.name}): {e}") from e
+
+
+# ============================================================================
+# 데이터 모델
+# ============================================================================
+
 @dataclass
 class AutoDialogEvent:
     window_title: str
@@ -175,15 +540,40 @@ class ConversionTask:
     source_root: Path | None = None
     status: str = STATUS_PENDING
     error: str | None = None
+    created_files: list[Path] = field(default_factory=list)
+    output_size: int | None = None
+    output_mtime: float | None = None
+    save_format: str | None = None
+    export_method: str | None = None
+    progid_used: str | None = None
+    backup_file: Path | None = None
+    retry_count: int = 0
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        rec: dict[str, Any] = {
             "input_file": str(self.input_file),
             "output_file": str(self.output_file),
             "source_root": str(self.source_root) if self.source_root else None,
             "status": self.status,
             "detail": self.error or "",
         }
+        if self.retry_count > 0:
+            rec["retry_count"] = self.retry_count
+        if self.created_files:
+            rec["created_files"] = [str(p) for p in self.created_files]
+        if self.output_size is not None:
+            rec["output_size"] = self.output_size
+        if self.output_mtime is not None:
+            rec["output_mtime"] = round(self.output_mtime, 3)
+        if self.save_format:
+            rec["save_format"] = self.save_format
+        if self.export_method:
+            rec["export_method"] = self.export_method
+        if self.progid_used:
+            rec["progid_used"] = self.progid_used
+        if self.backup_file:
+            rec["backup_file"] = str(self.backup_file)
+        return rec
 
 
 @dataclass
@@ -195,6 +585,9 @@ class PlannedConversion:
     skipped_tasks: list[ConversionTask] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     conflict_renamed_count: int = 0
+    backup_enabled: bool = False
+    backup_max_per_stem: int = BACKUP_MAX_FILES_PER_STEM
+    pdf_export_mode: str = "saveas_first"
 
 
 @dataclass
@@ -207,6 +600,9 @@ class ConversionSummary:
     mode: str = "real"
     auto_dialog_enabled: bool = False
     auto_dialog_events: list[AutoDialogEvent] = field(default_factory=list)
+    backup_enabled: bool = False
+    backup_count: int = 0
+    pdf_export_mode: str = "saveas_first"
 
     def to_json_dict(self) -> dict[str, Any]:
         success = len([task for task in self.tasks if task.status == STATUS_SUCCESS])
@@ -214,6 +610,9 @@ class ConversionSummary:
         skipped = len([task for task in self.tasks if task.status == STATUS_SKIPPED])
         clicked = len([event for event in self.auto_dialog_events if event.clicked])
         detected = len(self.auto_dialog_events)
+        total_created = sum(len(t.created_files) for t in self.tasks if t.status == STATUS_SUCCESS)
+        total_output_size = sum(t.output_size or 0 for t in self.tasks if t.status == STATUS_SUCCESS)
+
         return {
             "summary": {
                 "format_type": self.format_type,
@@ -222,8 +621,13 @@ class ConversionSummary:
                 "success_count": success,
                 "failed_count": failed,
                 "skipped_count": skipped,
+                "total_created_files": total_created or success,
+                "total_output_size_bytes": total_output_size,
                 "elapsed_seconds": self.elapsed_seconds,
                 "progid_used": self.progid_used,
+                "pdf_export_mode": self.pdf_export_mode if self.format_type == "PDF" else None,
+                "backup_enabled": self.backup_enabled,
+                "backup_count": self.backup_count,
                 "warnings": dedupe_strings(self.warnings),
                 "auto_dialog_enabled": self.auto_dialog_enabled,
                 "auto_dialog_detected_count": detected,
@@ -241,7 +645,18 @@ class RealWorkerResult:
     warnings: list[str] = field(default_factory=list)
     progid_used: str | None = None
     auto_dialog_events: list[AutoDialogEvent] = field(default_factory=list)
+    created_files: list[Path] = field(default_factory=list)
+    output_size: int | None = None
+    output_mtime: float | None = None
+    save_format: str | None = None
+    export_method: str | None = None
+    backup_file: Path | None = None
+    final_output_file: Path | None = None
 
+
+# ============================================================================
+# 작업 플래너 (TaskPlanner)
+# ============================================================================
 
 class TaskPlanner:
     def build_tasks(
@@ -254,6 +669,9 @@ class TaskPlanner:
         output_path: str,
         allow_empty: bool,
         preserve_source_root: bool,
+        backup_enabled: bool = False,
+        backup_max_per_stem: int = BACKUP_MAX_FILES_PER_STEM,
+        pdf_export_mode: str = "saveas_first",
     ) -> PlannedConversion:
         tasks: list[ConversionTask] = []
         skipped: list[ConversionTask] = []
@@ -266,6 +684,15 @@ class TaskPlanner:
         normalized_sources = [Path(canonicalize_path(src)) for src in sources]
         multiple_sources = len(normalized_sources) > 1
         explicit_output_root = Path(canonicalize_path(output_path)) if output_path else None
+
+        if explicit_output_root:
+            if not explicit_output_root.exists():
+                try:
+                    explicit_output_root.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    raise ValueError(f"출력 폴더를 생성할 수 없습니다: {explicit_output_root} ({e})") from e
+            if not check_write_permission(explicit_output_root):
+                warnings.append(f"출력 폴더에 쓰기 권한이 부족할 수 있습니다: {explicit_output_root}")
 
         if multiple_sources and explicit_output_root and not same_location and not preserve_source_root:
             warnings.append("여러 입력 소스를 함께 변환할 때 결과 추적이 중요하면 --preserve-source-root 사용을 권장합니다.")
@@ -285,11 +712,17 @@ class TaskPlanner:
                     raise ValueError(f"지원하지 않는 입력 파일입니다: {source}")
                 source_files = [source]
             else:
-                source_files = sorted(iter_supported_files(source, include_sub=include_sub), key=lambda path: str(path).lower())
+                source_files = sorted(
+                    iter_supported_files(source, include_sub=include_sub),
+                    key=lambda path: str(path).lower(),
+                )
                 if not source_files:
                     warnings.append(f"지원 파일이 없는 폴더를 건너뜀: {source}")
 
             for input_file in source_files:
+                if is_path_length_risky(input_file):
+                    warnings.append(f"입력 파일 경로가 너무 깁니다 (240자 이상): {input_file.name}")
+
                 if input_file.suffix.lower() == out_ext.lower():
                     skipped.append(
                         ConversionTask(
@@ -316,6 +749,9 @@ class TaskPlanner:
                         preserve_source_root=preserve_source_root,
                     )
 
+                if is_path_length_risky(output_file):
+                    warnings.append(f"출력 파일 경로가 너무 깁니다 (240자 이상): {output_file.name}")
+
                 tasks.append(
                     ConversionTask(
                         input_file=input_file,
@@ -340,6 +776,9 @@ class TaskPlanner:
             tasks=tasks,
             skipped_tasks=skipped,
             warnings=warnings,
+            backup_enabled=backup_enabled,
+            backup_max_per_stem=backup_max_per_stem,
+            pdf_export_mode=pdf_export_mode,
         )
 
     def _build_output_file(
@@ -370,48 +809,99 @@ class TaskPlanner:
         parent_name = source.parent.name or "files"
         return Path(parent_name)
 
-    def resolve_output_conflicts(self, tasks: list[ConversionTask], overwrite: bool) -> int:
+    def allocate_output_path(
+        self,
+        task: ConversionTask,
+        *,
+        used_path_keys: set[str],
+        overwrite: bool,
+        format_type: str | None = None,
+    ) -> bool:
+        """충돌 없는 출력 파일 경로를 할당하고 변경 여부를 반환합니다."""
+        original_path = task.output_file
+        orig_key = artifact_key(original_path)
+        batch_duplicate = orig_key in used_path_keys
+        conflicts = [] if overwrite else existing_artifact_conflicts(original_path, format_type or "PDF")
+        has_existing_conflict = bool(conflicts)
+
+        if not (batch_duplicate or has_existing_conflict):
+            used_path_keys.add(orig_key)
+            return False
+
+        counter = 1
+        stem = original_path.stem
+        ext = original_path.suffix
+        parent = original_path.parent
+        while counter <= MAX_FILENAME_COUNTER:
+            candidate = parent / f"{stem} ({counter}){ext}"
+            candidate_key = artifact_key(candidate)
+            cand_conflicts = [] if overwrite else existing_artifact_conflicts(candidate, format_type or "PDF")
+            if (candidate_key not in used_path_keys) and not cand_conflicts:
+                task.output_file = candidate
+                used_path_keys.add(candidate_key)
+                return True
+            counter += 1
+
+        fallback_name = f"{stem}_{int(time.time())}{ext}"
+        task.output_file = parent / fallback_name
+        used_path_keys.add(artifact_key(task.output_file))
+        return True
+
+    def resolve_output_conflicts(
+        self,
+        tasks: list[ConversionTask],
+        overwrite: bool,
+        format_type: str | None = None,
+    ) -> int:
         if overwrite:
             return 0
-        used_paths: set[Path] = set()
+        used_path_keys: set[str] = set()
         renamed_count = 0
         for task in tasks:
-            original_path = task.output_file
-            if task.output_file.exists() or task.output_file in used_paths:
-                counter = 1
-                stem = original_path.stem
-                ext = original_path.suffix
-                parent = original_path.parent
-                while counter <= MAX_FILENAME_COUNTER:
-                    candidate = parent / f"{stem} ({counter}){ext}"
-                    if (not candidate.exists()) and (candidate not in used_paths):
-                        task.output_file = candidate
-                        break
-                    counter += 1
-                if task.output_file == original_path:
-                    task.output_file = parent / f"{stem}_{int(time.time())}{ext}"
-                if task.output_file != original_path:
-                    renamed_count += 1
-            used_paths.add(task.output_file)
+            if self.allocate_output_path(task, used_path_keys=used_path_keys, overwrite=overwrite, format_type=format_type):
+                renamed_count += 1
         return renamed_count
 
+
+# ============================================================================
+# Mock 변환기
+# ============================================================================
 
 class MockConverter:
     def __init__(self) -> None:
         self.progid_used = "mock"
+        self.last_created_files: list[Path] = []
+        self.last_output_size: int | None = None
+        self.last_output_mtime: float | None = None
+        self.last_save_format: str | None = None
+        self.last_export_method: str | None = "MockSave"
 
     def initialize(self) -> bool:
         return True
 
     def convert_file(self, input_path: Path, output_path: Path, format_type: str = "PDF") -> tuple[bool, str | None]:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = f"mock-converted:{Path(input_path).name}->{format_type}\n"
-        output_path.write_text(payload, encoding="utf-8")
+        if format_type.upper() == "PDF":
+            payload = b"%PDF-1.4 Mock PDF stream for testing\n%%EOF\n"
+            output_path.write_bytes(payload)
+        else:
+            payload_str = f"mock-converted:{Path(input_path).name}->{format_type}\n"
+            output_path.write_text(payload_str, encoding="utf-8")
+
+        self.last_created_files = [output_path]
+        self.last_output_size = output_path.stat().st_size
+        self.last_output_mtime = output_path.stat().st_mtime
+        self.last_save_format = FORMAT_TYPES.get(format_type, {}).get("save_format", format_type)
+        self.last_export_method = "MockSave"
         return True, None
 
     def cleanup(self) -> None:
         return None
 
+
+# ============================================================================
+# 요약 및 종료 코드
+# ============================================================================
 
 def render_human(summary: ConversionSummary) -> str:
     data = summary.to_json_dict()["summary"]
@@ -419,6 +909,8 @@ def render_human(summary: ConversionSummary) -> str:
         f"형식: {data['format_type']} ({data['mode']})",
         f"총 {data['total_requested']}건 | 성공 {data['success_count']} | 실패 {data['failed_count']} | 건너뜀 {data['skipped_count']}",
     ]
+    if summary.backup_enabled:
+        lines.append(f"백업 생성: {data['backup_count']}건 (backup/ 폴더)")
     if data["warnings"]:
         lines.append("경고: " + " / ".join(data["warnings"]))
     if summary.auto_dialog_enabled:

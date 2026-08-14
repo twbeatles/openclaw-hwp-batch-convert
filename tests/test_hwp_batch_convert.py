@@ -14,7 +14,20 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import hwp_batch_convert as cli
+from hwp_batch_core import (
+    FORMAT_TYPES,
+    MockConverter,
+    TaskPlanner,
+    com_path_candidates,
+    create_backup,
+    existing_artifact_conflicts,
+    is_path_length_risky,
+    is_valid_path_name,
+    prune_old_backups,
+    to_extended_win_path,
+)
 from hwp_batch_dialogs import AutoAllowDialogWatcher
+from hwp_batch_print import is_valid_pdf_file, remove_incomplete_output
 
 
 def make_sample_tree(tmp_path: Path) -> Path:
@@ -113,7 +126,11 @@ def test_same_location_and_output_dir_are_mutually_exclusive(tmp_path: Path) -> 
         )
 
 
-def test_failed_tasks_return_nonzero_without_partial_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_failed_tasks_return_nonzero_without_partial_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     src = make_sample_tree(tmp_path)
 
     def fake_convert(self, input_path, output_path, format_type="PDF"):
@@ -142,7 +159,11 @@ def test_failed_tasks_return_nonzero_without_partial_success(tmp_path: Path, mon
     assert exit_code == 1
 
 
-def test_allow_partial_success_keeps_zero_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_allow_partial_success_keeps_zero_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     src = make_sample_tree(tmp_path)
 
     def fake_convert(self, input_path, output_path, format_type="PDF"):
@@ -172,7 +193,11 @@ def test_allow_partial_success_keeps_zero_exit(tmp_path: Path, monkeypatch: pyte
     assert exit_code == 0
 
 
-def test_report_json_written_on_exception(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_report_json_written_on_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     src = make_sample_tree(tmp_path)
     report = tmp_path / "report.json"
 
@@ -198,6 +223,163 @@ def test_report_json_written_on_exception(tmp_path: Path, monkeypatch: pytest.Mo
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert exit_code == 1
     assert payload["error"] == "planned failure"
+
+
+def test_backup_creation_and_prune(tmp_path: Path) -> None:
+    sample_file = tmp_path / "doc.hwp"
+    sample_file.write_text("original content", encoding="utf-8")
+
+    # 1. 백업 생성
+    b1 = create_backup(sample_file, max_files=2)
+    assert b1.exists()
+    assert b1.parent.name == "backup"
+    assert b1.name.startswith("doc_")
+
+    b2 = create_backup(sample_file, max_files=2)
+    assert b2.exists()
+
+    b3 = create_backup(sample_file, max_files=2)
+    assert b3.exists()
+
+    # max_files=2 이므로 backup 폴더 내 파일은 최대 2개만 남아야 함
+    backups = list((tmp_path / "backup").glob("doc_*.hwp"))
+    assert len(backups) == 2
+    assert b3 in backups
+
+
+def test_auxiliary_artifact_conflicts(tmp_path: Path) -> None:
+    out_html = tmp_path / "document.html"
+    out_files_dir = tmp_path / "document.files"
+    out_files_dir.mkdir()
+    (out_files_dir / "image1.png").write_text("img", encoding="utf-8")
+
+    # HTML 보조 디렉터리 충돌 감지 확인
+    conflicts = existing_artifact_conflicts(out_html, "HTML")
+    assert any(c == out_files_dir for c in conflicts)
+
+    # TaskPlanner가 충돌 시 새 번호 할당하는지 확인
+    planner = TaskPlanner()
+    src = tmp_path / "document.hwp"
+    src.write_text("data", encoding="utf-8")
+
+    plan = planner.build_tasks(
+        sources=[str(src)],
+        format_type="HTML",
+        include_sub=False,
+        same_location=False,
+        output_path=str(tmp_path),
+        allow_empty=False,
+        preserve_source_root=False,
+    )
+    renamed = planner.resolve_output_conflicts(plan.tasks, overwrite=False, format_type="HTML")
+    assert renamed == 1
+    assert plan.tasks[0].output_file.name == "document (1).html"
+
+
+def test_pdf_magic_and_cleanup(tmp_path: Path) -> None:
+    valid_pdf = tmp_path / "valid.pdf"
+    valid_pdf.write_bytes(b"%PDF-1.4 header and some dummy content here to make it over 64 bytes long for testing validity\n%%EOF")
+    assert is_valid_pdf_file(valid_pdf) is True
+
+    invalid_pdf = tmp_path / "invalid.pdf"
+    invalid_pdf.write_bytes(b"NOT A PDF")
+    assert is_valid_pdf_file(invalid_pdf) is False
+
+    # 불완전 파일 정리
+    remove_incomplete_output(invalid_pdf)
+    assert not invalid_pdf.exists()
+
+
+def test_path_utilities() -> None:
+    assert is_valid_path_name("C:\\Valid\\Path\\File.hwp") is True
+    assert is_valid_path_name("C:\\Invalid|Path<>.hwp") is False
+
+    extended = to_extended_win_path("C:\\docs\\test.hwp")
+    assert extended.startswith("\\\\?\\")
+
+    cands = com_path_candidates("C:\\docs\\test.hwp")
+    assert len(cands) >= 1
+    assert "C:\\docs\\test.hwp" in cands[0] or "C:\\docs\\test.hwp" in cands[-1]
+
+    assert is_path_length_risky("A" * 250) is True
+    assert is_path_length_risky("A" * 50) is False
+
+
+def test_mock_conversion_audit_metadata_and_backup(tmp_path: Path) -> None:
+    src = make_sample_tree(tmp_path)
+    out = tmp_path / "out"
+
+    args = cli.parse_args(
+        [
+            str(src),
+            "--format",
+            "PDF",
+            "--output-dir",
+            str(out),
+            "--mode",
+            "mock",
+            "--backup",
+            "--retry-count",
+            "2",
+            "--json",
+        ]
+    )
+    summary = cli.run_conversion(args)
+    payload = summary.to_json_dict()
+
+    assert payload["summary"]["success_count"] == 3
+    assert payload["summary"]["backup_enabled"] is True
+    assert payload["summary"]["backup_count"] == 3
+    assert payload["summary"]["total_created_files"] == 3
+
+    for task in payload["tasks"]:
+        assert task["status"] == "성공"
+        assert task["created_files"]
+        assert task["output_size"] is not None
+        assert task["output_mtime"] is not None
+        assert task["save_format"] == "PDF"
+        assert task["export_method"] == "MockSave"
+        assert task["backup_file"] is not None
+        assert Path(task["backup_file"]).exists()
+
+
+def test_retry_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample_file = tmp_path / "retry_doc.hwp"
+    sample_file.write_text("data", encoding="utf-8")
+    out = tmp_path / "out"
+
+    attempts = 0
+
+    def fail_then_succeed(self, input_path, output_path, format_type="PDF"):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False, "temporary glitch"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"%PDF-1.4 mock stream\n%%EOF")
+        return True, None
+
+    monkeypatch.setattr(cli.MockConverter, "convert_file", fail_then_succeed)
+
+    args = cli.parse_args(
+        [
+            str(sample_file),
+            "--format",
+            "PDF",
+            "--output-dir",
+            str(out),
+            "--mode",
+            "mock",
+            "--retry-count",
+            "2",
+        ]
+    )
+    summary = cli.run_conversion(args)
+    payload = summary.to_json_dict()
+
+    assert payload["summary"]["success_count"] == 1
+    assert attempts == 2
+    assert payload["tasks"][0]["retry_count"] == 1
 
 
 def _launch_dialog_process(*, delayed_button: bool) -> subprocess.Popen[str]:

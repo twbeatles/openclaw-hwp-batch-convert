@@ -1,40 +1,26 @@
 # HwpMate 재사용 메모
 
-이 스킬의 최소 CLI는 `twbeatles/HwpMate`의 다음 구조를 직접 참고해 경량 재구성했다.
+이 스킬의 CLI 엔진은 `twbeatles/HwpMate`의 핵심 안정성·변환 품질 로직과 프로젝트 감사(Audit) 권장사항을 직접 참고해 고도화했다.
 
-- `hwpmate/services/hwp_converter.py`
-  - pywin32 + HWP COM 초기화
-  - `Open` + `SaveAs` + `Clear` 기반 변환 흐름
-  - 여러 ProgID 폴백 시도
-- `hwpmate/services/task_planner.py`
-  - 폴더/파일 입력을 변환 작업 목록으로 펼치기
-  - 동일 형식 자동 건너뜀
-  - 출력 경로 충돌 시 ` (1)`, ` (2)` 번호 부여
-- `hwpmate/constants.py`
-  - 지원 입력 확장자, 출력 포맷 매핑, ProgID 목록
+- `hwpmate/services/hwp_security_module.py`
+  - FilePathCheckerModuleExample.dll 번들 SHA-256 무결성 검증
+  - `%LOCALAPPDATA%` 영구 설치 및 HKCU `HwpAutomation/Modules`, `HwpCtrl/Modules` 레지스트리 4종 경로 등록 (`hwp_batch_security.py`)
+  - 1단계 보안 모듈 사전 등록 + 2단계 `AutoAllowDialogWatcher` 폴백의 2중 안전망
+- `hwpmate/services/hwp_print_settings/`
+  - 인쇄 설정 1쪽씩 일반 인쇄(`PrintMethod=0`) 리셋
+  - SaveAs 실패 시 `PrintToPDFEx` / `RunToPDF` 가상 프린터 자동 폴백
+  - `%PDF` 매직 헤더 검증 및 실패 시 불완전 산출물 자동 정리 (`hwp_batch_print.py`)
+- `hwpmate/services/artifact_policy.py` & `artifact_snapshot.py`
+  - HTML(`.files` 폴더), 이미지(`_1.png` 다중 페이지 등) 보조 산출물 충돌 감지 및 회피
+  - 변환 실패 시 비-PDF 보조 산출물까지 자동 정리 (Audit A-02 해결)
+- `hwpmate/services/hwp_converter.py` & `hwpmate/workers/conversion_worker/`
+  - 저장 직전 원자적 충돌 재검증 및 새 번호 동적 할당 (Audit A-01 TOCTOU 방어)
+  - `_suppress_hwp_ui_flash` 백그라운드 창 숨김 및 암호 문서 안내 힌트
+  - 감사 메타데이터 수집 (`created_files`, `output_size`, `output_mtime`, `save_format`, `export_method`, `progid_used`, `backup_file`)
+- `hwpmate/workers/conversion_worker/backup.py`
+  - 원본 자동 백업 (`--backup`), stem별 최대 백업 수 제한 및 오래된 백업 정리 (`--backup-max-per-stem`)
 - `hwpmate/path_utils.py`
-  - 지원 파일 순회 로직
-- `hwpmate/models.py`
-  - 작업/요약 데이터 구조
-
-스킬 쪽 구현은 OpenClaw에서 바로 쓰기 쉽게 GUI 의존성(PyQt6)을 제거하고 CLI 중심으로 축소했다.
-
-## 차이점
-
-- GUI, 백업, 트레이, 토스트, CSV/TXT 실패 리포트는 제외
-- OpenClaw에서 쓰기 좋은 `--plan-only`, `--json`, `--report-json`, `--mode mock` 추가
-- `sources` 인자에 파일/폴더 여러 개를 동시에 받을 수 있게 단순화
-- 기본 목적은 `한글 문서 일괄 처리` 요청에서 빠르게 실행 가능한 최소 기능 제공
-
-## 이후 보강된 점
-
-초기 경량 버전 이후 아래 안전성/운영성 보강이 추가되었다.
-
-- `real` 모드를 worker subprocess로 분리해 startup/file timeout을 강제 가능하게 구성
-- `--kill-owned-hwp-on-timeout` 으로 timeout 시 이번 실행이 띄운 HWP 프로세스만 정리 시도
-- `--auto-allow-dialogs` watcher에 PID 범위 제한 추가
-- delayed button 같은 UI 지연 상황을 고려한 재스캔 로직 추가
-- 단일 비지원 입력 파일을 조용히 무시하지 않고 조기 에러 처리
-- `--allow-partial-success`, `--fail-fast`, `--allow-empty` 등 자동화 친화적 종료 정책 추가
-- `--preserve-source-root` 로 다중 source 결과 구조 보강
-- planner / CLI / dialog watcher 동작을 `pytest` 로 고정
+  - 긴 경로 및 UNC 대응 `com_path_candidates` 확장 경로(`\\?\`) 폴백
+  - 240자/260자 경로 길이 경고 및 쓰기 권한 검사
+- `hwpmate/models.py` & `constants.py`
+  - 상세 데이터 모델 및 상수 매핑
