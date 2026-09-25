@@ -276,6 +276,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plan-only", action="store_true", help="실제 변환 없이 작업 계획만 출력")
     parser.add_argument("--mode", choices=["real", "mock"], default="real", help="real=한글 COM 실변환, mock=테스트용 가짜 변환")
     parser.add_argument("--auto-allow-dialogs", action="store_true", help="한글 보안 확인 팝업을 소유 HWP 프로세스 범위에서만 자동 클릭")
+    parser.add_argument("--auto-continue-compat-dialog", dest="auto_continue_compat_dialog", action="store_true", default=True, help="DOCX/RTF 변환 시 '배치가 변경될 수 있습니다' 확인 창에 소유 HWP 프로세스 범위에서만 자동 '계속' 응답(기본값: 켜짐)")
+    parser.add_argument("--no-auto-continue-compat-dialog", dest="auto_continue_compat_dialog", action="store_false", help="호환 확인 창 자동 응답 끔")
     parser.add_argument("--ensure-security-module", action="store_true", default=True, help="한글 보안 모듈(FilePathCheckDLL) 설치 및 등록 보장(기본값: 켜짐)")
     parser.add_argument("--no-ensure-security-module", dest="ensure_security_module", action="store_false", help="보안 모듈 등록 건너뜀")
     parser.add_argument("--pdf-export-mode", choices=["saveas_first", "print_to_pdf_ex_first"], default="saveas_first", help="PDF 변환 전략(saveas_first: 품질우선, print_to_pdf_ex_first: 모아찍기완화우선)")
@@ -305,6 +307,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--worker-backup-max-per-stem", type=int, default=20, help=argparse.SUPPRESS)
     parser.add_argument("--worker-pdf-export-mode", default="saveas_first", help=argparse.SUPPRESS)
     parser.add_argument("--worker-ensure-security-module", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-disable-compat-dialog", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args(argv)
     if args.internal_worker_real_convert:

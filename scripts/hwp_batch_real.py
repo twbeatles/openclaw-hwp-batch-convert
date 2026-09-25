@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Tuple
 
 from hwp_batch_core import (
-    FORMAT_TYPES,
     HWP_PROGIDS,
     AutoDialogEvent,
     RealWorkerResult,
@@ -19,16 +21,17 @@ from hwp_batch_core import (
     create_backup,
     dedupe_strings,
     existing_artifact_conflicts,
+    is_com_failure_result,
     kill_processes,
     parse_json_text,
     read_json_file,
     remove_new_attempt_artifacts,
     safe_unlink,
+    save_format_candidates,
     snapshot_artifacts,
-    uses_auxiliary_artifacts,
     write_json_file,
 )
-from hwp_batch_dialogs import AutoAllowDialogWatcher
+from hwp_batch_dialogs import AutoAllowDialogWatcher, HwpCompatDialogResponder
 from hwp_batch_print import (
     EXPORT_METHOD_PRINT_TO_PDF_EX,
     EXPORT_METHOD_RUN_TO_PDF,
@@ -58,35 +61,68 @@ SECURITY_MODULE_ALIASES = (
 )
 
 
-def snapshot_hwp_pids() -> set[int]:
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-        )
-        if result.returncode != 0:
-            return set()
-        import csv
-        import io
+TH32CS_SNAPPROCESS = 0x00000002
 
-        reader = csv.reader(io.StringIO(result.stdout))
+_snapshot_failure_count = 0
+_snapshot_last_error: str | None = None
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+def get_snapshot_health() -> tuple[int, str | None]:
+    """(연속 실패 횟수, 마지막 오류 메시지). UI/워커 경고용."""
+    return _snapshot_failure_count, _snapshot_last_error
+
+
+def snapshot_hwp_pids() -> set[int]:
+    """실행 중인 한글 관련 프로세스 PID 집합 반환.
+
+    tasklist 서브프로세스 대신 Toolhelp32를 직접 써서 콘솔 깜빡임을 막는다.
+    """
+    global _snapshot_failure_count, _snapshot_last_error
+    try:
+        kernel32 = ctypes.windll.kernel32
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (-1, 0xFFFFFFFF):
+            _snapshot_failure_count += 1
+            _snapshot_last_error = "CreateToolhelp32Snapshot invalid handle"
+            return set()
+
         pids: set[int] = set()
-        for row in reader:
-            if len(row) < 2:
-                continue
-            image_name = row[0].strip().lower()
-            if image_name not in HWP_PROCESS_NAMES:
-                continue
-            try:
-                pids.add(int(row[1]))
-            except ValueError:
-                pass
-        return pids
-    except Exception:
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                _snapshot_failure_count += 1
+                _snapshot_last_error = "Process32FirstW failed"
+                return set()
+            while True:
+                image_name = entry.szExeFile.strip().lower()
+                if image_name in HWP_PROCESS_NAMES:
+                    pids.add(int(entry.th32ProcessID))
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+            _snapshot_failure_count = 0
+            _snapshot_last_error = None
+            return pids
+        finally:
+            kernel32.CloseHandle(snapshot)
+    except Exception as e:
+        _snapshot_failure_count += 1
+        _snapshot_last_error = str(e)
         return set()
 
 
@@ -110,8 +146,16 @@ class RealHwpConverter:
         self.is_initialized = False
         self.owned_pids: set[int] = set()
         self.pythoncom = None
-        self.security_module_registered = False
+        self.security_module_registered: bool | None = None
+        self.security_module_error: str | None = None
         self.security_module_warning: str | None = None
+        self.snapshot_unreliable = False
+        self.process_tracking_warning: str | None = None
+        # 호환 확인 문서("배치가 변경될 수 있습니다") 창 자동 계속 (소유 PID 한정)
+        self.auto_continue_compat_dialogs = True
+        self.compat_dialog_responses = 0
+        # True only when this instance called CoInitialize itself.
+        self._com_apartment_owned = False
         self.last_created_files: list[Path] = []
         self.last_output_size: int | None = None
         self.last_output_mtime: float | None = None
@@ -119,7 +163,7 @@ class RealHwpConverter:
         self.last_export_method: str | None = None
         self.pdf_export_mode: str = PDF_EXPORT_SAVEAS_FIRST
 
-    def initialize(self, *, ensure_security: bool = True) -> bool:
+    def initialize(self, *, ensure_security: bool = True, manage_com_apartment: bool = True) -> bool:
         if self.is_initialized:
             return True
 
@@ -130,18 +174,25 @@ class RealHwpConverter:
             raise RuntimeError("pywin32가 필요합니다. `pip install pywin32` 후 다시 실행해주세요.") from exc
 
         self.pythoncom = pythoncom
-        try:
-            pythoncom.CoInitialize()
-        except Exception:
-            pass
+        if manage_com_apartment:
+            try:
+                pythoncom.CoInitialize()
+                self._com_apartment_owned = True
+            except Exception:
+                # 이미 초기화된 스레드에서는 소유권 없이 계속
+                self._com_apartment_owned = False
+        else:
+            self._com_apartment_owned = False
 
         # 1. 보안 모듈 DLL 설치 + 레지스트리 사전 준비
         prep_ok = False
+        prep_msg = ""
         prep_alias = None
         if ensure_security:
             try:
                 prep_ok, prep_msg, prep_alias = ensure_hwp_security_module()
             except Exception as e:
+                prep_msg = str(e)
                 self.security_module_warning = f"보안 모듈 사전 준비 예외: {e}"
 
         dispatch_factory = getattr(win32_client, "DispatchEx", win32_client.Dispatch)
@@ -154,28 +205,80 @@ class RealHwpConverter:
                 self.progid_used = progid
 
                 # 2. RegisterModule 시도
-                aliases: list[str] = list(SECURITY_MODULE_ALIASES)
+                aliases: list[str] = []
                 if prep_alias and prep_alias not in aliases:
-                    aliases.insert(0, prep_alias)
+                    aliases.append(prep_alias)
+                for name in SECURITY_MODULE_ALIASES:
+                    if name not in aliases:
+                        aliases.append(name)
 
+                module_errors: list[str] = []
+                self.security_module_registered = False
+                self.security_module_error = None
                 for alias in aliases:
                     try:
                         res = self.hwp.RegisterModule("FilePathCheckDLL", alias)
-                        if res is not False and res != 0 and prep_ok:
+                        if is_com_failure_result(res):
+                            module_errors.append(f"{alias}: RegisterModule returned {res!r}")
+                            continue
+                        if prep_ok:
                             self.security_module_registered = True
+                            self.security_module_error = None
                             break
-                    except Exception:
-                        pass
+                        self.security_module_registered = False
+                        self.security_module_error = (
+                            f"RegisterModule({alias}) 호출은 result={res!r}였으나 "
+                            f"레지스트리 DLL 사전 준비 실패: {prep_msg}"
+                        )
+                        break
+                    except Exception as module_error:
+                        module_errors.append(f"{alias}: {module_error}")
+
+                if not self.security_module_registered and self.security_module_error is None:
+                    self.security_module_error = (
+                        f"prep={prep_msg}; " + ("; ".join(module_errors) or "알 수 없는 오류")
+                    )
+                    self.security_module_warning = (
+                        "한글 보안 모듈 등록 실패 (파일 접근 시 '모두 허용' 창이 뜰 수 있음): "
+                        f"{self.security_module_error}"
+                    )
 
                 self.hwp.SetMessageBoxMode(0x00000001)
                 time.sleep(0.2)
-                self.owned_pids = snapshot_hwp_pids() - before_pids
+                after_pids = snapshot_hwp_pids()
+                fail_count, fail_msg = get_snapshot_health()
+                self.snapshot_unreliable = fail_count > 0 and not after_pids and not before_pids
+                self.owned_pids = after_pids - before_pids
                 self.is_initialized = True
+                if self.snapshot_unreliable:
+                    detail = f" ({fail_msg})" if fail_msg else ""
+                    self.process_tracking_warning = (
+                        "한글 프로세스 스냅샷(Toolhelp) 수집에 실패했습니다"
+                        f"{detail}. 강제 종료·감시 범위가 제한될 수 있습니다."
+                    )
+                elif not self.owned_pids:
+                    self.process_tracking_warning = (
+                        "새로 생성된 한글 프로세스를 추적하지 못했습니다. "
+                        "강제 종료는 비활성화되며 변환 외 다른 한글 창을 추적 대상으로 삼지 않습니다."
+                    )
                 self._suppress_hwp_ui_flash()
                 return True
             except Exception as exc:
                 errors.append(f"{progid}: {exc}")
+                self.hwp = None
+                self.progid_used = None
+                # 연결 실패 후 고아 HWP 프로세스가 남았으면 이번 시도에서 생긴 PID만 정리
+                orphan_pids = snapshot_hwp_pids() - before_pids
+                if orphan_pids:
+                    kill_processes(orphan_pids)
+                continue
 
+        if self._com_apartment_owned and self.pythoncom is not None:
+            try:
+                self.pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            self._com_apartment_owned = False
         raise RuntimeError("한글 COM 객체 생성에 실패했습니다.\n" + "\n".join(errors))
 
     def _suppress_hwp_ui_flash(self) -> None:
@@ -210,12 +313,42 @@ class RealHwpConverter:
         Returns:
             (성공 여부, 에러 메시지, 실제 저장된 출력 경로)
         """
+        responder = self._compat_dialog_responder()
+        with responder:
+            try:
+                return self._convert_file_impl(
+                    input_path,
+                    output_path,
+                    format_type,
+                    overwrite=overwrite,
+                    pdf_export_mode=pdf_export_mode,
+                )
+            finally:
+                count = int(getattr(responder, "response_count", 0) or 0)
+                if count:
+                    self.compat_dialog_responses += count
+
+    def _compat_dialog_responder(self):
+        if not self.auto_continue_compat_dialogs or not self.owned_pids:
+            # 소유 PID 미추적 시 다른 한글 세션 창을 건드리지 않는다.
+            return nullcontext()
+        return HwpCompatDialogResponder(lambda: set(self.owned_pids))
+
+    def _convert_file_impl(
+        self,
+        input_path: Path,
+        output_path: Path,
+        format_type: str = "PDF",
+        *,
+        overwrite: bool = True,
+        pdf_export_mode: str = PDF_EXPORT_SAVEAS_FIRST,
+    ) -> Tuple[bool, str | None, Path]:
+        """단일 파일 변환 본체 (호환 확인 창 응답은 convert_file 래퍼가 담당)."""
         if not self.is_initialized or self.hwp is None:
             return False, "한글 COM 객체가 초기화되지 않았습니다.", output_path
 
         format_key = str(format_type).upper()
-        format_info = FORMAT_TYPES.get(format_key, FORMAT_TYPES["PDF"])
-        save_format = format_info["save_format"]
+        format_candidates = save_format_candidates(format_key)
         pdf_mode = normalize_pdf_export_mode(pdf_export_mode)
 
         # 1. 저장 직전 원자적 충돌 재검사 (TOCTOU 방어 - Audit A-01)
@@ -239,12 +372,18 @@ class RealHwpConverter:
         self.last_created_files = []
         self.last_output_size = None
         self.last_output_mtime = None
-        self.last_save_format = save_format
+        self.last_save_format = format_candidates[0]
         self.last_export_method = None
 
         input_candidates = com_path_candidates(input_path)
         output_candidates = com_path_candidates(actual_output_file)
         before_artifacts = snapshot_artifacts(actual_output_file, format_key)
+
+        # 환경에 따라 Open 직전 재등록이 필요한 경우가 있어 호출만 보장 (실패 무시)
+        try:
+            self.hwp.RegisterModule("FilePathCheckDLL", SECURITY_MODULE_ALIAS)
+        except Exception:
+            pass
 
         def _cleanup_failed_artifacts() -> None:
             remove_new_attempt_artifacts(before_artifacts, actual_output_file, format_key)
@@ -255,7 +394,7 @@ class RealHwpConverter:
         for in_candidate in input_candidates:
             try:
                 open_result = self.hwp.Open(in_candidate, "", "forceopen:true")
-                if open_result is not False and open_result != 0:
+                if not is_com_failure_result(open_result):
                     opened = True
                     break
             except Exception as e:
@@ -285,21 +424,32 @@ class RealHwpConverter:
 
         def _try_saveas() -> bool:
             nonlocal export_error
-            for out_candidate in output_candidates:
-                try:
-                    res = self.hwp.SaveAs(out_candidate, save_format)
-                    if res is not False and res != 0:
+            errors: list[str] = []
+            # 형식 문자열 후보 × 경로 후보 × (2-param → 3-param 폴백)
+            for format_name in format_candidates:
+                for out_candidate in output_candidates:
+                    try:
+                        save_result = self.hwp.SaveAs(out_candidate, format_name)
+                        if is_com_failure_result(save_result):
+                            raise RuntimeError(f"SaveAs 2-param returned failure: {save_result!r}")
+                        self.last_save_format = format_name
                         self.last_export_method = EXPORT_METHOD_SAVEAS_2
                         return True
-                except Exception:
-                    pass
-                try:
-                    res = self.hwp.SaveAs(out_candidate, save_format, "")
-                    if res is not False and res != 0:
-                        self.last_export_method = EXPORT_METHOD_SAVEAS_3
-                        return True
-                except Exception as e:
-                    export_error = str(e)
+                    except Exception as e1:
+                        try:
+                            save_result = self.hwp.SaveAs(out_candidate, format_name, "")
+                            if is_com_failure_result(save_result):
+                                raise RuntimeError(
+                                    f"SaveAs 3-param returned failure: {save_result!r}"
+                                )
+                            self.last_save_format = format_name
+                            self.last_export_method = EXPORT_METHOD_SAVEAS_3
+                            return True
+                        except Exception as e2:
+                            errors.append(
+                                f"{format_name} {out_candidate}: 2-param: {e1}, 3-param: {e2}"
+                            )
+            export_error = "; ".join(errors) if errors else "SaveAs 실패"
             return False
 
         def _try_print_to_pdf() -> bool:
@@ -367,7 +517,12 @@ class RealHwpConverter:
         if format_key == "PDF":
             pdf_target = actual_output_file if actual_output_file in changed else changed[0]
             if not is_valid_pdf_file(pdf_target):
-                remove_incomplete_output(pdf_target)
+                prev = before_artifacts.get(pdf_target)
+                remove_incomplete_output(
+                    pdf_target,
+                    before_mtime_ns=prev.mtime_ns if prev else None,
+                    before_size=prev.size if prev else None,
+                )
                 if used_saveas and not used_print:
                     if _try_print_to_pdf():
                         after_artifacts = snapshot_artifacts(actual_output_file, format_key)
@@ -401,7 +556,9 @@ class RealHwpConverter:
     def cleanup(self) -> None:
         if self.hwp is not None and self.is_initialized:
             try:
-                self.hwp.Clear(3)
+                # 1=hwpDiscard. 2/3은 한글 2022 실측에서 열린 원본 문서가
+                # 템프에 남으므로 사용하지 않는다.
+                self.hwp.Clear(1)
             except Exception:
                 pass
             try:
@@ -410,12 +567,15 @@ class RealHwpConverter:
                 pass
             self.hwp = None
             self.is_initialized = False
+            self.owned_pids.clear()
+            self.process_tracking_warning = None
 
-        if self.pythoncom is not None:
+        if self._com_apartment_owned and self.pythoncom is not None:
             try:
                 self.pythoncom.CoUninitialize()
             except Exception:
                 pass
+            self._com_apartment_owned = False
 
 
 def _make_worker_state_path() -> Path:
@@ -437,6 +597,7 @@ def _worker_command(
     backup_max_per_stem: int,
     pdf_export_mode: str,
     ensure_security_module: bool,
+    compat_dialog: bool = True,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -463,6 +624,8 @@ def _worker_command(
         command.append("--worker-backup")
     if ensure_security_module:
         command.append("--worker-ensure-security-module")
+    if not compat_dialog:
+        command.append("--worker-disable-compat-dialog")
     return command
 
 
@@ -484,6 +647,7 @@ def run_real_worker_task(task, args, script_path: Path) -> RealWorkerResult:
             backup_max_per_stem=getattr(args, "backup_max_per_stem", 20),
             pdf_export_mode=getattr(args, "pdf_export_mode", "saveas_first"),
             ensure_security_module=getattr(args, "ensure_security_module", True),
+            compat_dialog=getattr(args, "auto_continue_compat_dialog", True),
         ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -531,6 +695,9 @@ def run_real_worker_task(task, args, script_path: Path) -> RealWorkerResult:
             owned_pids = {int(pid) for pid in state_payload.get("owned_pids", [])}
             if args.kill_owned_hwp_on_timeout and not owned_pids:
                 owned_pids = snapshot_hwp_pids() - before_pids
+            if owned_pids:
+                # 이미 종료된 PID 재사용 오사를 막기 위해 살아있는 HWP로 한정
+                owned_pids &= snapshot_hwp_pids()
 
             if args.kill_owned_hwp_on_timeout and owned_pids:
                 killed_pids = kill_processes(owned_pids)
@@ -604,6 +771,7 @@ def run_internal_real_worker(args) -> int:
 
     converter = RealHwpConverter()
     converter.pdf_export_mode = getattr(args, "worker_pdf_export_mode", PDF_EXPORT_SAVEAS_FIRST)
+    converter.auto_continue_compat_dialogs = not getattr(args, "worker_disable_compat_dialog", False)
     warnings: list[str] = []
     watcher: AutoAllowDialogWatcher | None = None
     backup_path: Path | None = None
@@ -651,6 +819,12 @@ def run_internal_real_worker(args) -> int:
             pdf_export_mode=converter.pdf_export_mode,
         )
         events = watcher.snapshot_events()
+        if converter.compat_dialog_responses > 0:
+            warnings.append(
+                "한글 호환 확인(배치가 변경될 수 있습니다) 창에 "
+                f"{converter.compat_dialog_responses}회 자동 '계속' 응답했습니다. "
+                "DOCX/RTF 등 변환 식이 원본과 배치가 다를 수 있어 결과를 확인하세요."
+            )
         payload = {
             "ok": ok,
             "error": error,

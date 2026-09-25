@@ -54,11 +54,14 @@
 - 하위 폴더 포함/제외 옵션 (`--include-sub` / `--no-include-sub`)
 - 같은 형식 자동 건너뜀
 - 파일명 충돌 시 자동 번호 부여 및 **저장 직전 원자적 재검증(TOCTOU 방어)**
+- **원본 문서 보호**: `--overwrite`라도 기존 `.hwp/.hwpx` 원본은 교체하지 않고 번호 부여 (예: `a.hwpx` → `a.hwp` 변환이 원본 `a.hwp`를 덮지 않음)
 - **HTML(`.files` 폴더) 및 이미지 다중 산출물(Auxiliary Artifacts) 추적/충돌 회피 및 실패 시 자동 정리**
 - **한글 보안 모듈(FilePathCheckDLL) 사전 준비 + 레지스트리 자동 등록 (`--ensure-security-module`)**
 - **2단계 보안 안전망**: 1단계 보안 DLL 등록 + 2단계 `AutoAllowDialogWatcher` 폴백
+- **호환 확인 창 자동 응답**: DOCX/RTF 변환 시 `변환 문서(배치가 변경될 수 있습니다)` 창에 자동 `계속` 응답 (`--auto-continue-compat-dialog`, 기본 켜짐, 소유 HWP 프로세스 범위 한정, 응답 횟수는 경고문에 기록)
 - **PDF 변환 품질 고도화**: 문서 인쇄 설정(모아찍기 등) 1쪽씩 일반 인쇄 리셋 (`PrintMethod=0`)
 - **PDF 가상 프린터 자동 폴백**: SaveAs 실패 시 `PrintToPDFEx` / `RunToPDF` 자동 시도 (물리 프린터 출력은 원천 차단)
+- **ODT 저장 형식**: 한글 2022 실측에 맞춰 SaveAs `"ODF"` 우선, `"ODT"` 대체 후보로 순차 시도
 - **`%PDF` 매직 헤더 검증 및 불완전/깨진 파일 자동 정리**
 - **변환 전 원본 파일 자동 백업 (`--backup`, `--backup-max-per-stem`)**
 - 긴 경로(240자/260자) 및 UNC 네트워크 경로 대응용 `com_path_candidates` 확장 경로(`\\?\`) 지원
@@ -68,7 +71,8 @@
 - `--report-json` 결과/에러 JSON 파일 저장
 - `--mode mock` 모의 변환 테스트
 - `--startup-timeout-seconds`, `--file-timeout-seconds` real 모드 timeout 제어
-- `--kill-owned-hwp-on-timeout` timeout 시 자동화로 띄운 HWP 정리 시도
+- `--kill-owned-hwp-on-timeout` timeout 시 자동화로 띄운 HWP 정리 시도 (살아있는 HWP PID로 한정)
+- HWP 프로세스 추적을 Toolhelp 스냅샷으로 전환 (콘솔 깜빡임 제거, 수집 실패 시 경고)
 - `--fail-fast` 실패 후 즉시 중단
 - `--allow-partial-success` 부분 실패 허용 종료 코드
 - `--allow-empty` 빈 입력 허용
@@ -246,6 +250,7 @@ python scripts/hwp_batch_convert.py "C:\docs\hwp" --format PDF --output-dir "C:\
 - `--plan-only`: 실제 변환 없이 계획만 출력
 - `--mode real|mock`: 실변환 또는 모의 변환
 - `--auto-allow-dialogs`: 한글 보안 확인 팝업 자동 허용
+- `--auto-continue-compat-dialog` / `--no-auto-continue-compat-dialog`: 호환 확인 창 자동 `계속` 응답 켜기/끄기 (기본 켜짐)
 - `--startup-timeout-seconds`: real 모드 초기화 timeout
 - `--file-timeout-seconds`: real 모드 파일별 변환 timeout
 - `--kill-owned-hwp-on-timeout`: timeout 시 이번 실행이 띄운 HWP 정리 시도

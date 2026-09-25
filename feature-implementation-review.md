@@ -28,6 +28,14 @@ HwpMate(`twbeatles/HwpMate`)의 핵심 안정성 아키텍처 및 프로젝트 �
 7. **정밀 감사 메타데이터(Audit Report) 확장 및 패키징**
    - JSON 리포트에 `created_files`, `output_size`, `output_mtime`, `save_format`, `export_method`, `progid_used`, `backup_file`, `retry_count` 필드 제공.
    - 배포용 `hwp-batch-convert.skill` 단일 아카이브 최신화.
+8. **HwpMate 정밀 대조 추가 반영**
+   - ODT SaveAs 기본값 `ODF` + 대체 후보 `ODT` 순차 시도 (`save_format_candidates`).
+   - 보조 산출물 판정 정밀화: 공백·괄호 제외, 이미지 3자리 페이지 번호, HTML `PIC*` 임베드, 원본·`backup/` 제외.
+   - 스냅샷 `ctime` 포함 + 0바이트 산출물 실패 처리, 불완전 파일 삭제 스냅샷 필수 계약.
+   - 백업 prune 정규식 정확 매칭 + 타임스탬프 정렬, 출력 할당 원본 문서 보호, 타임스탬프 폴백.
+   - Toolhelp 프로세스 스냅샷, COM apartment 소유권, 보안모듈 3상태, 고아 PID 정리, `Clear(1)`.
+   - 인쇄 리셋 3경로 + 설치 프린터 우선 해석, 강제 종료는 살아있는 HWP PID로 한정.
+   - 호환 확인 창(`변환 문서`) 자동 응답 `--auto-continue-compat-dialog` (기본 켜짐, `HwpCompatDialogResponder`).
 
 ## 남아 있는 성격의 리스크
 

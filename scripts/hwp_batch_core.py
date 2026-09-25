@@ -29,8 +29,21 @@ WINDOWS_PATH_WARN_LENGTH = 240
 WINDOWS_PATH_BLOCK_LENGTH = 260
 
 AUXILIARY_ARTIFACT_FORMATS = frozenset({"HTML", "PNG", "JPG", "BMP", "GIF"})
-AUXILIARY_NAME_DELIMITERS = frozenset({"_", "-", " ", ".", "("})
+IMAGE_ARTIFACT_FORMATS = frozenset({"PNG", "JPG", "BMP", "GIF"})
+# 공백·괄호 제외: "report (1)" 같은 기존 문서를 "report"의 보조 산출물로 오인하지 않는다.
+AUXILIARY_NAME_DELIMITERS = frozenset({"_", "-", "."})
 MAX_AUXILIARY_SCAN_FILES = 500
+
+# 한글 2022(12.0) 실측: 이미지 SaveAs는 요청 경로 뒤에 페이지마다
+# "{stem}001.png", "{stem}002.png"처럼 구분자 없이 3자리 번호를 붙여 생성한다.
+_PAGE_NUMBER_REST = re.compile(r"^\d{3}(\.|$)")
+_IMAGE_PAGE_SUFFIX = re.compile(r"^[_-]?\d{3}$")
+# 한글 2022 HTML 내보내기는 본문 이미지·서식을 문서 이름과 무관하게 "PIC388B.png" 형태로 생성한다.
+_HTML_EMBEDDED_IMAGE = re.compile(r"^PIC[0-9A-F]+\.(png|jpe?g|gif|bmp|wmf|emf)$", re.IGNORECASE)
+
+# 산출물 후보에서 제외: 원본 한글 문서·백업 폴더는 다른 변환의 산출물이 아니다.
+PROTECTED_SOURCE_EXTENSIONS = frozenset(ext.lower() for ext in SUPPORTED_EXTENSIONS)
+EXCLUDED_ARTIFACT_DIR_NAMES = frozenset({BACKUP_DIR_NAME.lower()})
 
 HWP_PROGIDS = [
     "HWPControl.HwpCtrl.1",
@@ -43,7 +56,8 @@ FORMAT_TYPES: dict[str, dict[str, str]] = {
     "HWPX": {"ext": ".hwpx", "save_format": "HWPX"},
     "PDF": {"ext": ".pdf", "save_format": "PDF"},
     "DOCX": {"ext": ".docx", "save_format": "OOXML"},
-    "ODT": {"ext": ".odt", "save_format": "ODT"},
+    # 한글 2022(12.0) 실측: SaveAs "ODT"는 실패하고 "ODF"로만 .odt 생성. "ODT"는 대체 후보로 유지.
+    "ODT": {"ext": ".odt", "save_format": "ODF"},
     "HTML": {"ext": ".html", "save_format": "HTML"},
     "RTF": {"ext": ".rtf", "save_format": "RTF"},
     "TXT": {"ext": ".txt", "save_format": "TEXT"},
@@ -52,6 +66,31 @@ FORMAT_TYPES: dict[str, dict[str, str]] = {
     "BMP": {"ext": ".bmp", "save_format": "BMP"},
     "GIF": {"ext": ".gif", "save_format": "GIF"},
 }
+
+# 버전별 SaveAs 형식 문자열 차이 대응용 대체 후보 (기본 save_format 실패 시 순서대로 시도)
+ALT_SAVE_FORMATS: dict[str, tuple[str, ...]] = {
+    "ODT": ("ODT",),
+}
+
+
+def save_format_candidates(format_type: str) -> tuple[str, ...]:
+    """SaveAs 형식 문자열 후보 (기본 + 대체)."""
+    key = str(format_type).upper()
+    info = FORMAT_TYPES.get(key, FORMAT_TYPES["PDF"])
+    candidates = [info["save_format"]]
+    for name in ALT_SAVE_FORMATS.get(key, ()):
+        if name and name not in candidates:
+            candidates.append(name)
+    return tuple(candidates)
+
+
+def is_com_failure_result(result: object) -> bool:
+    """COM Open/SaveAs 실패 반환값 판정 (False 또는 0; bool True와 정수 0을 구분)."""
+    if result is False:
+        return True
+    if result == 0 and not isinstance(result, bool):
+        return True
+    return False
 
 STATUS_PENDING = "대기"
 STATUS_PLANNED = "계획됨"
@@ -240,7 +279,7 @@ def kill_processes(pids: Iterable[int]) -> list[int]:
     for pid in sorted({int(pid) for pid in pids if int(pid) > 0}):
         try:
             result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                ["taskkill", "/PID", str(pid), "/F"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -262,7 +301,8 @@ def uses_auxiliary_artifacts(format_type: str) -> bool:
     return format_type.upper() in AUXILIARY_ARTIFACT_FORMATS
 
 
-def matches_artifact_stem(name: str, stem: str) -> bool:
+def matches_artifact_stem(name: str, stem: str, *, allow_page_number: bool = False) -> bool:
+    """파일/디렉터리 이름이 출력 stem에 속한 보조 산출물인지 판정한다."""
     name_key = name.lower()
     stem_key = stem.lower()
     if not stem_key:
@@ -271,9 +311,59 @@ def matches_artifact_stem(name: str, stem: str) -> bool:
         return True
     if not name_key.startswith(stem_key):
         return False
-    if len(name_key) == len(stem_key):
+    rest = name_key[len(stem_key):]
+    if rest[0] in AUXILIARY_NAME_DELIMITERS:
         return True
-    return name_key[len(stem_key)] in AUXILIARY_NAME_DELIMITERS
+    return allow_page_number and bool(_PAGE_NUMBER_REST.match(rest))
+
+
+def is_protected_source_path(path: Path) -> bool:
+    """변환 입력이 될 수 있는 원본 한글 문서 경로인지 (확장자 기준)."""
+    return path.suffix.lower() in PROTECTED_SOURCE_EXTENSIONS
+
+
+def is_artifact_candidate(
+    path: Path,
+    output_file: Path,
+    format_type: str,
+    *,
+    for_conflict: bool = False,
+) -> bool:
+    """output_file 변환의 산출물(기본/보조)이 될 수 있는 경로인지 판정한다.
+
+    - 기본 출력 파일 이름은 항상 후보
+    - 원본 한글 문서(.hwp/.hwpx)·백업 폴더는 제외
+    - 이미지 형식은 같은 확장자의 페이지 파일({stem}001, {stem}_001)만 후보
+    - HTML은 문서 이름과 무관한 PIC* 임베드 이미지도 스냅샷 대상으로 포함
+      (충돌 판정에서는 제외: 무관한 PIC 파일까지 충돌로 보면 과다 회피)
+    """
+    name = path.name
+    if name.lower() == output_file.name.lower():
+        return True
+    if not uses_auxiliary_artifacts(format_type):
+        return False
+    fmt = format_type.upper()
+    try:
+        is_dir = path.is_dir()
+    except OSError:
+        return False
+    if is_dir:
+        if name.lower() in EXCLUDED_ARTIFACT_DIR_NAMES:
+            return False
+        return matches_artifact_stem(name, output_file.stem)
+    if is_protected_source_path(path):
+        return False
+    if fmt in IMAGE_ARTIFACT_FORMATS:
+        if path.suffix.lower() != output_file.suffix.lower():
+            return False
+        base_key = path.stem.lower()
+        stem_key = output_file.stem.lower()
+        if not stem_key or not base_key.startswith(stem_key):
+            return False
+        return bool(_IMAGE_PAGE_SUFFIX.match(base_key[len(stem_key):]))
+    if fmt == "HTML" and not for_conflict and _HTML_EMBEDDED_IMAGE.match(name):
+        return True
+    return matches_artifact_stem(name, output_file.stem)
 
 
 def artifact_key(path: Path) -> str:
@@ -295,11 +385,10 @@ def iter_candidate_artifact_paths(
     if not parent.exists():
         return list(candidates.values())
 
-    stem = output_file.stem
     nested_count = 0
     try:
         for child in parent.iterdir():
-            if not matches_artifact_stem(child.name, stem):
+            if not is_artifact_candidate(child, output_file, format_type):
                 continue
             if child.is_file():
                 candidates[artifact_key(child)] = child
@@ -339,7 +428,7 @@ def existing_artifact_conflicts(output_file: Path, format_type: str) -> list[Pat
         for child in parent.iterdir():
             if child == output_file:
                 continue
-            if matches_artifact_stem(child.name, output_file.stem):
+            if is_artifact_candidate(child, output_file, format_type, for_conflict=True):
                 conflicts[artifact_key(child)] = child
     except OSError:
         return list(conflicts.values())
@@ -351,6 +440,7 @@ def existing_artifact_conflicts(output_file: Path, format_type: str) -> list[Pat
 class FileArtifactSnapshot:
     size: int
     mtime_ns: int
+    ctime_ns: int
 
 
 def snapshot_artifacts(output_file: Path, format_type: str) -> dict[Path, FileArtifactSnapshot]:
@@ -361,7 +451,9 @@ def snapshot_artifacts(output_file: Path, format_type: str) -> dict[Path, FileAr
             if not path.is_file():
                 continue
             st = path.stat()
-            snapshot[path] = FileArtifactSnapshot(size=st.st_size, mtime_ns=st.st_mtime_ns)
+            snapshot[path] = FileArtifactSnapshot(
+                size=st.st_size, mtime_ns=st.st_mtime_ns, ctime_ns=st.st_ctime_ns
+            )
         except OSError:
             continue
     return snapshot
@@ -373,11 +465,9 @@ def changed_artifacts(
 ) -> list[Path]:
     changed: list[Path] = []
     for path, meta in after.items():
-        prev = before.get(path)
-        if prev is None:
-            changed.append(path)
+        if meta.size <= 0:
             continue
-        if meta.size != prev.size or meta.mtime_ns != prev.mtime_ns:
+        if before.get(path) != meta:
             changed.append(path)
     return sorted(changed, key=lambda p: str(p).lower())
 
@@ -428,6 +518,14 @@ def clamp_backup_max(max_files: int | None) -> int:
     return max(BACKUP_MAX_FILES_PER_STEM_MIN, min(BACKUP_MAX_FILES_PER_STEM_MAX, base))
 
 
+def _backup_name_pattern(stem: str, suffix: str) -> re.Pattern[str]:
+    """create_backup이 만드는 이름만 매칭: {stem}_{YYYYmmdd_HHMMSS_ffffff}[_{n}]{suffix}."""
+    return re.compile(
+        rf"^{re.escape(stem)}_(\d{{8}}_\d{{6}}_\d{{6}})(?:_(\d+))?{re.escape(suffix)}$",
+        re.IGNORECASE,
+    )
+
+
 def prune_old_backups(
     backup_dir: Path,
     stem: str,
@@ -438,27 +536,29 @@ def prune_old_backups(
 ) -> None:
     try:
         max_keep = clamp_backup_max(max_files)
-        prefix = f"{stem}_"
+        pattern = _backup_name_pattern(stem, suffix)
         keep_resolved = keep_path.resolve() if keep_path is not None else None
-        candidates: list[Path] = []
+        candidates: list[tuple[str, int, str, Path]] = []
         for entry in backup_dir.iterdir():
             if not entry.is_file():
                 continue
-            if entry.suffix.lower() != suffix.lower():
-                continue
-            if not entry.name.startswith(prefix):
+            match = pattern.match(entry.name)
+            if match is None:
                 continue
             if keep_resolved is not None and entry.resolve() == keep_resolved:
                 continue
-            candidates.append(entry)
+            counter = int(match.group(2)) if match.group(2) else 0
+            candidates.append((match.group(1), counter, entry.name, entry))
 
+        # keep_path 1개를 포함한 전체 상한
         slots_for_old = max_keep - (1 if keep_resolved is not None else 0)
         if slots_for_old < 0:
             slots_for_old = 0
         if len(candidates) <= slots_for_old:
             return
-        candidates.sort(key=lambda p: (p.stat().st_mtime, p.name))
-        for old in candidates[: len(candidates) - slots_for_old]:
+        # 파일명의 생성 타임스탬프 기준 (copy2가 원본 mtime을 보존하므로 mtime 사용 금지)
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        for _timestamp, _counter, _name, old in candidates[: len(candidates) - slots_for_old]:
             try:
                 old.unlink(missing_ok=True)
             except OSError:
@@ -821,8 +921,9 @@ class TaskPlanner:
         original_path = task.output_file
         orig_key = artifact_key(original_path)
         batch_duplicate = orig_key in used_path_keys
-        conflicts = [] if overwrite else existing_artifact_conflicts(original_path, format_type or "PDF")
-        has_existing_conflict = bool(conflicts)
+        has_existing_conflict = self._blocks_output_path(
+            original_path, overwrite, format_type or "PDF"
+        )
 
         if not (batch_duplicate or has_existing_conflict):
             used_path_keys.add(orig_key)
@@ -835,17 +936,40 @@ class TaskPlanner:
         while counter <= MAX_FILENAME_COUNTER:
             candidate = parent / f"{stem} ({counter}){ext}"
             candidate_key = artifact_key(candidate)
-            cand_conflicts = [] if overwrite else existing_artifact_conflicts(candidate, format_type or "PDF")
-            if (candidate_key not in used_path_keys) and not cand_conflicts:
+            if (candidate_key not in used_path_keys) and not self._blocks_output_path(
+                candidate, overwrite, format_type or "PDF"
+            ):
                 task.output_file = candidate
                 used_path_keys.add(candidate_key)
                 return True
             counter += 1
 
-        fallback_name = f"{stem}_{int(time.time())}{ext}"
-        task.output_file = parent / fallback_name
-        used_path_keys.add(artifact_key(task.output_file))
-        return True
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        fallback_counter = 1
+        while True:
+            suffix = "" if fallback_counter == 1 else f"_{fallback_counter}"
+            candidate = parent / f"{stem}_{timestamp}{suffix}{ext}"
+            candidate_key = artifact_key(candidate)
+            if (candidate_key not in used_path_keys) and not self._blocks_output_path(
+                candidate, overwrite, format_type or "PDF"
+            ):
+                task.output_file = candidate
+                used_path_keys.add(candidate_key)
+                return True
+            fallback_counter += 1
+
+    def _blocks_output_path(self, output_file: Path, overwrite: bool, format_type: str) -> bool:
+        # 원본 한글 문서(.hwp/.hwpx)는 덮어쓰기 허용과 무관하게 기존 파일을 보호한다.
+        # (예: a.hwpx -> a.hwp 변환이 같은 폴더의 원본 a.hwp를 교체하는 사고 방지)
+        if is_protected_source_path(output_file):
+            try:
+                if output_file.exists():
+                    return True
+            except OSError:
+                return True
+        if overwrite:
+            return False
+        return bool(existing_artifact_conflicts(output_file, format_type))
 
     def resolve_output_conflicts(
         self,

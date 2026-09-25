@@ -11,12 +11,14 @@ Current scope:
 - 폴더 단위 일괄 변환
 - 파일 여러 개 일괄 변환
 - HWP/HWPX → PDF 기본 변환 (SaveAs + PrintToPDFEx 가상 프린터 자동 폴백)
-- HWP/HWPX → HWPX/DOCX/ODT/HTML/RTF/TXT/PNG/JPG/BMP/GIF 변환
+- HWP/HWPX → HWPX/DOCX/ODT/HTML/RTF/TXT/PNG/JPG/BMP/GIF 변환 (ODT는 한글 2022 실측에 맞춰 SaveAs `"ODF"` 우선)
 - 동일 형식 자동 건너뜀
 - 출력 파일명 충돌 시 자동 번호 부여 및 저장 직전 원자적 재검증(TOCTOU 방어)
+- 원본 문서 보호: `--overwrite`라도 기존 `.hwp/.hwpx` 원본은 교체하지 않고 번호 부여
 - HTML(`.files`) 및 이미지 다중 산출물(Auxiliary Artifacts) 추적/충돌 회피 및 실패 시 자동 정리
 - 한글 보안 모듈(FilePathCheckDLL) 사전 준비 + 레지스트리 자동 등록
 - 보안 팝업 자동 허용용 `--auto-allow-dialogs` (2단계 폴백)
+- 호환 확인 창(`변환 문서`) 자동 `계속` 응답용 `--auto-continue-compat-dialog` (기본 켜짐, 소유 HWP 프로세스 범위 한정)
 - 변환 전 원본 파일 자동 백업 (`--backup`, `--backup-max-per-stem`)
 - `%PDF` 매직 헤더 검증 및 불완전 산출물 정리
 - 지원하지 않는 단일 파일 조기 에러 처리
@@ -40,6 +42,7 @@ This skill reuses and enhances the design of the source repo:
   - `hwpmate/services/hwp_converter/` (COM 제어 및 TOCTOU 충돌 방어)
   - `hwpmate/workers/conversion_worker/backup.py` (자동 백업)
   - `hwpmate/path_utils.py` (긴 경로 확장 경로 후보)
+  - `hwpmate/windows_integration/hwp_dialog_responder.py` (호환 확인 창 자동 응답)
 
 If you need the mapping details or reuse rationale, read:
 - `references/hwpmate-reuse-notes.md`

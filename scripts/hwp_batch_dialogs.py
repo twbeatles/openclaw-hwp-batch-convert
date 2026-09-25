@@ -20,6 +20,12 @@ USER32 = ctypes.WinDLL("user32", use_last_error=True)
 USER32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 USER32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
+# 호환 확인 창 응답(PostMessageW)은 순수 정수만 전달하므로 64비트 HWND 절단을 막기 위해 시그니처 고정.
+USER32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+USER32.PostMessageW.restype = wintypes.BOOL
+USER32.IsWindowVisible.argtypes = [wintypes.HWND]
+USER32.IsWindowVisible.restype = wintypes.BOOL
+
 
 def _get_window_text(hwnd: int) -> str:
     length = USER32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
@@ -190,3 +196,121 @@ class AutoAllowDialogWatcher:
     def _record_event(self, event: AutoDialogEvent) -> None:
         with self._lock:
             self.events.append(event)
+
+
+COMPAT_DIALOG_TITLES = frozenset({"변환 문서"})
+
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_CHAR = 0x0102
+VK_Y = 0x59
+SCAN_Y = 0x15
+
+COMPAT_POLL_INTERVAL_SECONDS = 0.2
+COMPAT_PER_WINDOW_COOLDOWN_SECONDS = 1.0
+
+
+def _post_continue_key(hwnd: int) -> bool:
+    """확인 창에 Y(계속) 키를 보낸다. Win32 버튼이 없어 BM_CLICK이 불가한 창용."""
+    down_lparam = 1 | (SCAN_Y << 16)
+    up_lparam = down_lparam | 0xC0000000
+    ok_down = bool(USER32.PostMessageW(hwnd, WM_KEYDOWN, VK_Y, down_lparam))
+    USER32.PostMessageW(hwnd, WM_CHAR, ord("y"), down_lparam)
+    ok_up = bool(USER32.PostMessageW(hwnd, WM_KEYUP, VK_Y, up_lparam))
+    return ok_down and ok_up
+
+
+def _compat_window_title(hwnd: int) -> str:
+    length = USER32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    USER32.GetWindowTextW(hwnd, buffer, length + 1)
+    return buffer.value.strip()
+
+
+class HwpCompatDialogResponder:
+    """DOCX/RTF 등 변환 시 뜨는 '변환 문서(배치가 변경될 수 있습니다. 계속?)' 확인 창에 자동 응답.
+
+    SetMessageBoxMode로 제어되지 않고 Win32 버튼 컨트롤도 없어 BM_CLICK이
+    불가하므로 Y 키 메시지로 '계속'을 선택한다. 소유 HWP PID 범위로만 동작하며,
+    같은 창에는 쿨다운 간격으로만 응답해 스팸을 막는다.
+    """
+
+    def __init__(
+        self,
+        pids_provider,
+        *,
+        poll_interval: float = COMPAT_POLL_INTERVAL_SECONDS,
+        cooldown: float = COMPAT_PER_WINDOW_COOLDOWN_SECONDS,
+    ) -> None:
+        self._pids_provider = pids_provider
+        self.poll_interval = max(0.02, float(poll_interval))
+        self.cooldown = max(0.0, float(cooldown))
+        self.response_count = 0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_response_at: dict[int, float] = {}
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="hwp-compat-dialogs", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.poll_interval):
+            self._poll_once()
+
+    def __enter__(self) -> 'HwpCompatDialogResponder':
+        self._stop_event.clear()
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    def _poll_once(self) -> int:
+        try:
+            pids = set(self._pids_provider())
+        except Exception:
+            return 0
+        if not pids:
+            return 0
+        hwnds: list[int] = []
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(
+            lambda hwnd, _: hwnds.append(hwnd) or True
+        )
+        try:
+            USER32.EnumWindows(enum_proc, 0)
+        except Exception:
+            return 0
+        now = time.monotonic()
+        responded = 0
+        for hwnd in hwnds:
+            try:
+                if not USER32.IsWindowVisible(hwnd):
+                    continue
+                if _get_window_pid(hwnd) not in pids:
+                    continue
+                if _compat_window_title(hwnd) not in COMPAT_DIALOG_TITLES:
+                    continue
+            except Exception:
+                continue
+            last = self._last_response_at.get(hwnd, 0.0)
+            if now - last < self.cooldown:
+                continue
+            try:
+                if _post_continue_key(hwnd):
+                    self._last_response_at[hwnd] = now
+                    responded += 1
+            except Exception:
+                continue
+        if responded:
+            with self._lock:
+                self.response_count += responded
+        return responded

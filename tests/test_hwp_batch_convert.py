@@ -21,9 +21,12 @@ from hwp_batch_core import (
     com_path_candidates,
     create_backup,
     existing_artifact_conflicts,
+    is_com_failure_result,
     is_path_length_risky,
+    is_protected_source_path,
     is_valid_path_name,
     prune_old_backups,
+    save_format_candidates,
     to_extended_win_path,
 )
 from hwp_batch_dialogs import AutoAllowDialogWatcher
@@ -285,9 +288,18 @@ def test_pdf_magic_and_cleanup(tmp_path: Path) -> None:
     invalid_pdf.write_bytes(b"NOT A PDF")
     assert is_valid_pdf_file(invalid_pdf) is False
 
-    # 불완전 파일 정리
-    remove_incomplete_output(invalid_pdf)
+    # 불완전 파일 정리 (이번 시도에서 새로 생긴 파일로 간주)
+    remove_incomplete_output(invalid_pdf, before_mtime_ns=None, before_size=None)
     assert not invalid_pdf.exists()
+
+    # 변환 전부터 있던 파일이 손대지 않은 채면 지우지 않음
+    kept = tmp_path / "kept.pdf"
+    kept.write_bytes(b"NOT A PDF BUT PRE-EXISTING")
+    kept_stat = kept.stat()
+    remove_incomplete_output(
+        kept, before_mtime_ns=kept_stat.st_mtime_ns, before_size=kept_stat.st_size
+    )
+    assert kept.exists()
 
 
 def test_path_utilities() -> None:
@@ -475,3 +487,90 @@ def test_dialog_watcher_respects_allowed_pid() -> None:
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_hwpmate_alignment_odt_save_format() -> None:
+    # 한글 2022 실측: ODT 기본 저장 형식은 ODF, ODT는 대체 후보
+    assert FORMAT_TYPES["ODT"]["save_format"] == "ODF"
+    assert save_format_candidates("ODT") == ("ODF", "ODT")
+    assert save_format_candidates("PDF") == ("PDF",)
+
+
+def test_hwpmate_alignment_com_failure_result() -> None:
+    assert is_com_failure_result(False) is True
+    assert is_com_failure_result(0) is True
+    assert is_com_failure_result(True) is False
+    assert is_com_failure_result(1) is False
+
+
+def test_hwpmate_alignment_protected_source_blocks_overwrite(tmp_path: Path) -> None:
+    from hwp_batch_core import ConversionTask
+
+    existing = tmp_path / "a.hwp"
+    existing.write_text("original", encoding="utf-8")
+
+    planner = TaskPlanner()
+    task = ConversionTask(input_file=tmp_path / "a.hwpx", output_file=existing)
+    renamed = planner.allocate_output_path(
+        task, used_path_keys=set(), overwrite=True, format_type="HWP"
+    )
+    # 덮어쓰기 허용이라도 원본 한글 문서는 보호되어 새 번호 할당
+    assert renamed is True
+    assert task.output_file.name == "a (1).hwp"
+    assert existing.read_text(encoding="utf-8") == "original"
+
+
+def test_hwpmate_alignment_auxiliary_stem_policy(tmp_path: Path) -> None:
+    # "report (1).html"은 report.html의 보조 산출물이 아님 (공백·괄호 제외)
+    (tmp_path / "report (1).html").write_text("other", encoding="utf-8")
+    # 원본 한글 문서는 보조 산출물 취급 금지
+    (tmp_path / "report1.hwp").write_text("src", encoding="utf-8")
+    conflicts = existing_artifact_conflicts(tmp_path / "report.html", "HTML")
+    assert all(c.name != "report (1).html" for c in conflicts)
+    assert all(c.suffix.lower() != ".hwp" for c in conflicts)
+
+    # 이미지 페이지 파일은 보조 산출물로 인정 (확장자 일치 + 3자리 번호)
+    (tmp_path / "img001.png").write_bytes(b"\x89PNG fake")
+    (tmp_path / "img2.png").write_bytes(b"\x89PNG fake")
+    (tmp_path / "img001.jpg").write_bytes(b"fake")
+    img_conflicts = {c.name for c in existing_artifact_conflicts(tmp_path / "img.png", "PNG")}
+    assert "img001.png" in img_conflicts
+    assert "img2.png" not in img_conflicts
+    assert "img001.jpg" not in img_conflicts
+
+
+def test_hwpmate_alignment_backup_prune_exact_pattern(tmp_path: Path) -> None:
+    sample = tmp_path / "doc.hwp"
+    sample.write_text("v", encoding="utf-8")
+    backup_dir = tmp_path / "backup"
+    backup_dir.mkdir()
+    # 백업 명명 규칙과 무관한 사용자 파일은 prune 대상이 아님
+    unrelated = backup_dir / "doc_draft.hwp"
+    unrelated.write_text("user file", encoding="utf-8")
+
+    create_backup(sample, max_files=2)
+    create_backup(sample, max_files=2)
+    create_backup(sample, max_files=2)
+
+    assert unrelated.exists()
+    assert unrelated.read_text(encoding="utf-8") == "user file"
+    pattern_backups = [p for p in backup_dir.glob("doc_*.hwp") if p != unrelated]
+    assert len(pattern_backups) == 2
+
+
+def test_hwpmate_alignment_compat_flag(tmp_path: Path) -> None:
+    src = make_sample_tree(tmp_path)
+    args = cli.parse_args(
+        [str(src), "--format", "PDF", "--output-dir", str(tmp_path / "out")]
+    )
+    assert args.auto_continue_compat_dialog is True
+    args_off = cli.parse_args(
+        [str(src), "--format", "PDF", "--output-dir", str(tmp_path / "out"),
+         "--no-auto-continue-compat-dialog"]
+    )
+    assert args_off.auto_continue_compat_dialog is False
+
+
+def test_hwpmate_alignment_protected_source_predicate() -> None:
+    assert is_protected_source_path(Path("a.hwp")) is True
+    assert is_protected_source_path(Path("a.pdf")) is False

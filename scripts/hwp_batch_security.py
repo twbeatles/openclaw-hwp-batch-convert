@@ -49,13 +49,15 @@ def bundled_dll_candidates() -> list[Path]:
     except OSError:
         pass
 
-    # 3. 로컬 HwpMate 저장소 경로 후보 (개발/연동 환경)
-    hwp_mate_dirs = [
-        Path(r"D:\twbeatles-repos\HwpMate\hwpmate\resources\security"),
-        Path(r"D:\github\HwpMate\hwpmate\resources\security"),
-    ]
-    for d in hwp_mate_dirs:
-        candidates.append(d / SECURITY_MODULE_DLL_NAME)
+    # 3. 같은 부모 아래 HwpMate 체크아웃 (개발/연동 환경).
+    # 드라이브 고정 경로 대신 스크립트 위치 기준으로 탐색한다.
+    try:
+        checkout_parent = Path(__file__).resolve().parent.parent
+        candidates.append(
+            checkout_parent / "HwpMate" / "hwpmate" / "resources" / "security" / SECURITY_MODULE_DLL_NAME
+        )
+    except OSError:
+        pass
 
     # 4. 실행 파일 디렉터리
     if getattr(sys, "frozen", False):

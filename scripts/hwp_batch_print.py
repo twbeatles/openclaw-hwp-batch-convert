@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 PDF_MAGIC = b"%PDF"
-MIN_PDF_BYTES = 64
+# 헤더 + 최소 본문. 변환 직후 생성된 빈/깨진 PDF를 걸러내는 하한이다.
+MIN_PDF_BYTES = 8
 
-EXPORT_METHOD_SAVEAS_2 = "SaveAs-2param"
-EXPORT_METHOD_SAVEAS_3 = "SaveAs-3param"
-EXPORT_METHOD_PRINT_TO_PDF_EX = "PrintToPDFEx"
-EXPORT_METHOD_RUN_TO_PDF = "RunToPDF"
+EXPORT_METHOD_SAVEAS_2 = "saveas_2"
+EXPORT_METHOD_SAVEAS_3 = "saveas_3"
+EXPORT_METHOD_PRINT_TO_PDF_EX = "print_to_pdf_ex"
+EXPORT_METHOD_RUN_TO_PDF = "run_to_pdf"
 
 PDF_EXPORT_SAVEAS_FIRST = "saveas_first"
 PDF_EXPORT_PRINT_TO_PDF_EX_FIRST = "print_to_pdf_ex_first"
@@ -18,7 +19,6 @@ PDF_EXPORT_PRINT_TO_PDF_EX_FIRST = "print_to_pdf_ex_first"
 PDF_PRINTER_NAME_CANDIDATES: tuple[str, ...] = (
     "Hancom PDF",
     "Microsoft Print to PDF",
-    "Adobe PDF",
 )
 
 PRINT_METHOD_NORMAL = 0
@@ -55,10 +55,14 @@ def is_valid_pdf_file(path: Path, *, min_bytes: int = MIN_PDF_BYTES) -> bool:
 def remove_incomplete_output(
     path: Path,
     *,
-    before_mtime_ns: int | None = None,
-    before_size: int | None = None,
+    before_mtime_ns: int | None,
+    before_size: int | None,
 ) -> None:
-    """내보내기 실패 후 깨진/부분 산출물을 정리합니다."""
+    """내보내기 실패 후 깨진/부분 산출물을 정리합니다.
+
+    변환 전에 이미 있던 파일이 손대지 않은 채(스냅샷과 동일)로 남아 있으면
+    절대 지우지 않는다. before_*는 필수: 호출자가 스냅샷을 전달해야 한다.
+    """
     try:
         if not path.exists():
             return
@@ -66,33 +70,76 @@ def remove_incomplete_output(
         if before_mtime_ns is not None and before_size is not None:
             if st.st_mtime_ns == before_mtime_ns and st.st_size == before_size:
                 return
+        # 새로 생겼거나 내용이 바뀌었는데 유효 PDF가 아니면 제거
         if before_mtime_ns is None or not is_valid_pdf_file(path):
             path.unlink(missing_ok=True)
     except OSError:
         pass
 
 
-def resolve_pdf_printer_candidates() -> list[str]:
-    """시스템에 등록된 가상 PDF 프린터 목록을 탐색합니다."""
-    found: list[str] = []
+def list_installed_printer_names() -> list[str]:
+    """설치된 프린터 이름 목록 (win32print 없으면 빈 목록)."""
     try:
         import win32print  # type: ignore
-
-        flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-        for item in win32print.EnumPrinters(flags):
-            name = item[2]
-            if any(cand.lower() in name.lower() for cand in ("hancom pdf", "print to pdf", "adobe pdf")):
-                found.append(name)
+    except ImportError:
+        return []
+    names: list[str] = []
+    try:
+        flags = getattr(win32print, "PRINTER_ENUM_LOCAL", 2) | getattr(
+            win32print, "PRINTER_ENUM_CONNECTIONS", 4
+        )
+        for entry in win32print.EnumPrinters(flags):
+            # (flags, description, name, comment) 형태가 일반적
+            if len(entry) >= 3 and entry[2]:
+                names.append(str(entry[2]))
     except Exception:
         pass
+    return names
 
-    for candidate in PDF_PRINTER_NAME_CANDIDATES:
-        if candidate not in found:
-            found.append(candidate)
-    return found
+
+def resolve_pdf_printer_candidates(
+    preferred: Sequence[str] | None = None,
+) -> list[str]:
+    """설치된 가상 PDF 프린터를 우선으로 후보 목록을 만든다."""
+    preferred_list = list(preferred) if preferred else list(PDF_PRINTER_NAME_CANDIDATES)
+    installed = list_installed_printer_names()
+    installed_lower = {name.lower(): name for name in installed}
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        # 설치 목록에 있으면 실제 표기 사용
+        ordered.append(installed_lower.get(key, name))
+
+    for name in preferred_list:
+        if name.lower() in installed_lower:
+            _add(name)
+    # 설치 목록에서 PDF/XPS 계열 프린터 추가 발굴
+    for name in installed:
+        lower = name.lower()
+        if any(token in lower for token in ("pdf", "xps", "hancom")):
+            _add(name)
+    # 조회 실패 환경에서도 시도 목록 보장
+    if not ordered:
+        for name in preferred_list:
+            _add(name)
+    return ordered
 
 
 def _set_param(obj: Any, attr: str, val: Any) -> bool:
+    """HParameterSet/ActionSet 속성은 SetItem 우선, 없으면 setattr로 설정."""
+    try:
+        setter = getattr(obj, "SetItem", None)
+        if callable(setter):
+            setter(attr, val)
+            return True
+    except Exception:
+        pass
     try:
         setattr(obj, attr, val)
         return True
@@ -100,34 +147,59 @@ def _set_param(obj: Any, attr: str, val: Any) -> bool:
         return False
 
 
-def _apply_safe_print_items(hprint: Any) -> None:
-    """HPrint 파라미터를 기본(1쪽씩 일반 인쇄)으로 안전하게 리셋합니다."""
-    for attr, val in (
+def _apply_safe_print_items(hprint: Any) -> int:
+    """공통 안전 인쇄 값 적용. 성공한 항목 수를 반환한다."""
+    pairs: list[tuple[str, Any]] = [
         ("PrintMethod", PRINT_METHOD_NORMAL),
-        ("printmethod", PRINT_METHOD_NORMAL),
-        ("Range", PRINT_RANGE_ALL),
-        ("range", PRINT_RANGE_ALL),
         ("NumCopy", PRINT_COPY_ONE),
-        ("numcopy", PRINT_COPY_ONE),
-        ("Collate", 0),
-        ("collate", 0),
-        ("Device", 0),
-        ("device", 0),
         ("ReverseOrder", 0),
-        ("reverseorder", 0),
         ("Pause", 0),
-        ("pause", 0),
+        ("Collate", 1),
+        ("PrintImage", 1),
+        ("PrintDrawObj", 1),
+        ("PrintClickHere", 0),
         ("PrintToFile", 0),
-        ("printtofile", 0),
-    ):
-        _set_param(hprint, attr, val)
+        ("UserOrder", 0),
+    ]
+    applied = 0
+    for key, value in pairs:
+        if _set_param(hprint, key, value):
+            applied += 1
+    return applied
 
 
 def apply_default_print_settings(hwp: Any) -> bool:
-    """HWP COM 문서의 인쇄 설정을 기본값으로 리셋합니다."""
+    """열린 문서의 인쇄 설정을 1쪽씩(PrintMethod=0) 기본값으로 best-effort 리셋.
+
+    Execute(실제 인쇄/PDF 생성)는 절대 하지 않는다.
+    SaveAs 경로 전에 호출하면 문서에 남은 모아찍기 등이 반영되는 것을 막는다.
+    """
     if hwp is None:
         return False
-    any_applied = False
+
+    any_ok = False
+
+    # 1) XHwpPrint 프로퍼티 (문서 단위)
+    try:
+        docs = getattr(hwp, "XHwpDocuments", None)
+        if docs is not None:
+            doc = docs.Item(0)
+            prn = getattr(doc, "XHwpPrint", None)
+            if prn is not None:
+                for key, value in (
+                    ("PrintMethod", PRINT_METHOD_NORMAL),
+                    ("NumCopy", PRINT_COPY_ONE),
+                    ("ReverseOrder", 0),
+                ):
+                    try:
+                        setattr(prn, key, value)
+                        any_ok = True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 2) HAction + HParameterSet.HPrint GetDefault (Execute 없음)
     try:
         hparam = getattr(hwp, "HParameterSet", None)
         haction = getattr(hwp, "HAction", None)
@@ -135,22 +207,29 @@ def apply_default_print_settings(hwp: Any) -> bool:
             pset = getattr(hparam, "HPrint", None)
             if pset is not None:
                 hset = getattr(pset, "HSet", pset)
-                haction.GetDefault("PrintToPDFEx", hset)
-                _apply_safe_print_items(pset)
-                any_applied = True
+                for action_id in ("PrintToPDFEx", "Print"):
+                    try:
+                        haction.GetDefault(action_id, hset)
+                        if _apply_safe_print_items(pset) > 0:
+                            any_ok = True
+                    except Exception:
+                        pass
     except Exception:
         pass
 
+    # 3) CreateAction("Print") GetDefault + SetItem 보정 (Execute 금지: 물리 인쇄 위험)
     try:
-        docs = getattr(hwp, "XHwpDocuments", None)
-        if docs is not None:
-            prn = docs.Item(0).XHwpPrint
-            prn.PrintMethod = PRINT_METHOD_NORMAL
-            any_applied = True
+        create_action = getattr(hwp, "CreateAction", None)
+        if callable(create_action):
+            act: Any = create_action("Print")
+            pset: Any = act.CreateSet()
+            act.GetDefault(pset)
+            if _apply_safe_print_items(pset) > 0:
+                any_ok = True
     except Exception:
         pass
 
-    return any_applied
+    return any_ok
 
 
 def try_export_pdf_via_print_to_pdf_ex(

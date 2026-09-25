@@ -24,3 +24,15 @@
   - 240자/260자 경로 길이 경고 및 쓰기 권한 검사
 - `hwpmate/models.py` & `constants.py`
   - 상세 데이터 모델 및 상수 매핑
+- `hwpmate/windows_integration/hwp_dialog_responder.py`
+  - `변환 문서(배치가 변경될 수 있습니다)` 확인 창에 Y키 자동 응답 (`HwpCompatDialogResponder`, 소유 PID 한정·창별 쿨다운)
+
+## 정밀 대조 추가 반영 (HwpMate 최신 구조 기준)
+
+- ODT SaveAs 기본값 `ODF` + 대체 후보 `ODT` 순차 시도 (`save_format_candidates`)
+- 보조 산출물 판정 정밀화: 공백·괄호 제외, 이미지 3자리 페이지 번호, HTML `PIC*` 임베드, 원본·`backup/` 제외
+- 스냅샷 `ctime` 포함 + 0바이트 산출물 실패 처리, 불완전 파일 삭제는 스냅샷 필수 계약으로 기존 파일 보호
+- 백업 prune 정규식 정확 매칭 + 타임스탬프 정렬 (`copy2` mtime 보존 대응)
+- 출력 할당에 원본 문서 보호 (`--overwrite` 무관), 타임스탬프 폴백
+- Toolhelp 프로세스 스냅샷 + COM apartment 소유권 + 보안모듈 3상태 + 고아 PID 정리 + `Clear(1)`
+- 인쇄 리셋 3경로 + 설치 프린터 우선 해석, 강제 종료는 살아있는 HWP PID로 한정
