@@ -103,6 +103,7 @@ def _with_document_access_hint(message: str) -> str:
 
 
 class RealHwpConverter:
+    hwp: Any
     def __init__(self) -> None:
         self.hwp = None
         self.progid_used: str | None = None
@@ -153,7 +154,7 @@ class RealHwpConverter:
                 self.progid_used = progid
 
                 # 2. RegisterModule 시도
-                aliases = list(SECURITY_MODULE_ALIASES)
+                aliases: list[str] = list(SECURITY_MODULE_ALIASES)
                 if prep_alias and prep_alias not in aliases:
                     aliases.insert(0, prep_alias)
 
@@ -495,7 +496,7 @@ def run_real_worker_task(task, args, script_path: Path) -> RealWorkerResult:
 
     started_at = time.monotonic()
     initialized_at: float | None = None
-    state_payload: dict[str, object] = {}
+    state_payload: dict[str, Any] = {}
     timeout_stage: str | None = None
 
     try:

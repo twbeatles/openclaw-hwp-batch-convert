@@ -1,0 +1,14 @@
+{
+  "include": ["scripts", "tests"],
+  "exclude": ["**/__pycache__", ".git"],
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "typeCheckingMode": "standard",
+  "reportMissingTypeStubs": "none",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["scripts"]
+    }
+  ]
+}

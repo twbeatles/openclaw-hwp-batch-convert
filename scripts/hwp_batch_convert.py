@@ -6,17 +6,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence, cast
 
 # Windows 콘솔 출력 UTF-8 안전화
 if hasattr(sys.stdout, "reconfigure"):
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        cast(Any, sys.stdout).reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 if hasattr(sys.stderr, "reconfigure"):
     try:
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        cast(Any, sys.stderr).reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
